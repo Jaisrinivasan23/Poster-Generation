@@ -1,0 +1,34 @@
+# FastAPI Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# HTTP Clients
+httpx==0.26.0
+aiohttp==3.9.1
+
+# AI SDKs
+anthropic==0.39.0
+
+# Image Processing
+Pillow==10.2.0
+
+# PDF Generation
+reportlab==4.2.5
+
+# HTML to Image Conversion
+playwright==1.40.0
+beautifulsoup4==4.12.3
+
+# AWS S3
+boto3==1.34.23
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# Data Validation
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Utilities
+python-dateutil==2.8.2
