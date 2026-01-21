@@ -11,3 +11,5 @@ from . import analyze_prompt
 from . import generate_image
 from . import generate_template
 from . import upload_s3
+from . import batch_processing
+from . import edit_poster

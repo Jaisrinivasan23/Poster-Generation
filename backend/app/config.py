@@ -28,6 +28,21 @@ class Settings(BaseSettings):
     # Server
     host: str = "0.0.0.0"
     port: int = 8000
+    
+    # RedPanda / Kafka Configuration
+    redpanda_broker: str = "localhost:19092"
+    redpanda_schema_registry: str = "http://localhost:18081"
+    
+    # PostgreSQL Configuration
+    postgres_host: str = "localhost"
+    postgres_port: int = 5432
+    postgres_db: str = "poster_generation"
+    postgres_user: str = "poster_user"
+    postgres_password: str = "poster_secure_pwd_2024"
+    
+    # Batch Processing Configuration
+    batch_size: int = 8
+    max_concurrent_jobs: int = 5
 
     class Config:
         env_file = ".env"
@@ -47,7 +62,13 @@ class Settings(BaseSettings):
             self.aws_secret_access_key,
             self.s3_base_url
         ])
+    
+    @property
+    def postgres_dsn(self) -> str:
+        """Get PostgreSQL connection DSN"""
+        return f"postgresql://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
 
 
 # Global settings instance
 settings = Settings()
+

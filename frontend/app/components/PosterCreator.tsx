@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import Papa from 'papaparse';
 import {
   PosterConfig,
@@ -17,6 +17,9 @@ import { PosterFlowMode } from '../types/poster';
 import { getTopmateLogo } from '../lib/topmate-logo';
 import { fetchTopmateProfile } from '../lib/topmate';
 import { apiFetch } from '../lib/api';
+import { useJobSSE, SSEProgressEvent, SSEPosterCompletedEvent, SSEJobCompletedEvent, SSELogEvent } from '../hooks/useJobSSE';
+
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_API_URL || 'http://localhost:8000';
 
 // API key is now handled server-side via environment variables
 
@@ -58,6 +61,13 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
   const [csvSkipOverlays, setCsvSkipOverlays] = useState(true); // Default to true since users typically include logo in template
   const [csvSaveSuccess, setCsvSaveSuccess] = useState(false);
   const [csvSavedConfig, setCsvSavedConfig] = useState<{campaign: string, content_type: string} | null>(null);
+  
+  // SSE Progress tracking for CSV mode
+  const [csvJobId, setCsvJobId] = useState<string | null>(null);
+  const [csvProgress, setCsvProgress] = useState({ processed: 0, total: 0, percentage: 0 });
+  const [csvLogs, setCsvLogs] = useState<string[]>([]);
+  const [showCsvLogs, setShowCsvLogs] = useState(false);
+  
   const [htmlSaveSuccess, setHtmlSaveSuccess] = useState(false);
   const [htmlSavedConfig, setHtmlSavedConfig] = useState<{campaign: string, content_type: string} | null>(null);
   const [referenceImage, setReferenceImage] = useState<string | null>(null);
@@ -109,6 +119,52 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
 
   // Preview ref
   const previewRef = useRef<HTMLIFrameElement>(null);
+
+  // SSE hook for CSV bulk generation
+  const handleCsvProgress = useCallback((event: SSEProgressEvent) => {
+    console.log('📊 [CSV SSE] Progress:', event);
+    setCsvProgress({
+      processed: event.processed,
+      total: event.total,
+      percentage: Math.round((event.processed / event.total) * 100)
+    });
+  }, []);
+
+  const handleCsvPosterCompleted = useCallback((event: SSEPosterCompletedEvent) => {
+    console.log('🖼️ [CSV SSE] Poster completed:', event.username);
+    setCsvGeneratedResults(prev => [...prev, {
+      username: event.username,
+      success: event.success,
+      posterUrl: event.poster_url,
+      error: event.error
+    }]);
+    setCsvLogs(prev => [...prev, `✅ Poster completed for ${event.username}`]);
+  }, []);
+
+  const handleCsvJobCompleted = useCallback((event: SSEJobCompletedEvent) => {
+    console.log('🎉 [CSV SSE] Job completed!', event);
+    setIsCsvGenerating(false);
+    setCsvJobId(null);
+    setCsvLogs(prev => [...prev, `🎉 All posters generated! Success: ${event.success_count}, Failed: ${event.failure_count}`]);
+  }, []);
+
+  const handleCsvLog = useCallback((event: SSELogEvent) => {
+    console.log('📝 [CSV SSE] Log:', event.message);
+    setCsvLogs(prev => [...prev, event.message]);
+  }, []);
+
+  const handleCsvSSEError = useCallback((error: Error) => {
+    console.error('❌ [CSV SSE] Error:', error);
+    setCsvLogs(prev => [...prev, `❌ Error: ${error.message}`]);
+  }, []);
+
+  const { isConnected: csvSSEConnected, connect: csvConnectSSE, disconnect: csvDisconnectSSE } = useJobSSE({
+    onProgress: handleCsvProgress,
+    onPosterCompleted: handleCsvPosterCompleted,
+    onJobCompleted: handleCsvJobCompleted,
+    onLog: handleCsvLog,
+    onError: handleCsvSSEError
+  });
 
   // Effect: When switching to expert mode, force single user mode
   useEffect(() => {
@@ -1581,6 +1637,9 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
 
                                   setIsCsvGenerating(true);
                                   setCsvGeneratedResults([]);
+                                  setCsvProgress({ processed: 0, total: csvData.length, percentage: 0 });
+                                  setCsvLogs(['🚀 Starting CSV bulk generation...']);
+                                  setShowCsvLogs(true);
                                   setError(null);
 
                                   try {
@@ -1609,11 +1668,23 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                                       throw new Error(data.error || 'Generation failed');
                                     }
 
-                                    setCsvGeneratedResults(data.results || []);
+                                    // Check if response has jobId (RedPanda queue mode)
+                                    if (data.success && data.jobId) {
+                                      console.log('🔗 [CSV] Connecting to SSE for job:', data.jobId);
+                                      setCsvJobId(data.jobId);
+                                      setCsvLogs(prev => [...prev, `📋 Job created: ${data.jobId}`, '📡 Connecting to SSE for real-time updates...']);
+                                      
+                                      // Connect to SSE for real-time progress
+                                      csvConnectSSE(data.jobId);
+                                    } else if (data.results) {
+                                      // Fallback: Direct results (old mode)
+                                      setCsvGeneratedResults(data.results);
+                                      setIsCsvGenerating(false);
+                                    }
                                   } catch (err) {
                                     setError(err instanceof Error ? err.message : 'Generation failed');
-                                  } finally {
                                     setIsCsvGenerating(false);
+                                    setCsvLogs(prev => [...prev, `❌ Error: ${err instanceof Error ? err.message : 'Generation failed'}`]);
                                   }
                                 }}
                                 disabled={isCsvGenerating || !csvCampaignName.trim()}
@@ -1636,6 +1707,51 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                                   </>
                                 )}
                               </button>
+
+                              {/* Progress Bar and Logs for CSV Generation */}
+                              {isCsvGenerating && (
+                                <div className="mt-4 p-4 bg-slate-50 rounded-lg border-2 border-slate-200">
+                                  {/* Progress Bar */}
+                                  <div className="mb-3">
+                                    <div className="flex justify-between text-sm text-slate-600 mb-1">
+                                      <span>Processing posters...</span>
+                                      <span>{csvProgress.processed} / {csvProgress.total} ({csvProgress.percentage}%)</span>
+                                    </div>
+                                    <div className="w-full bg-slate-200 rounded-full h-3">
+                                      <div 
+                                        className="bg-gradient-to-r from-purple-600 to-pink-600 h-3 rounded-full transition-all duration-300"
+                                        style={{ width: `${csvProgress.percentage}%` }}
+                                      />
+                                    </div>
+                                  </div>
+                                  
+                                  {/* SSE Connection Status */}
+                                  <div className="flex items-center gap-2 text-xs text-slate-500 mb-2">
+                                    <span className={`w-2 h-2 rounded-full ${csvSSEConnected ? 'bg-green-500' : 'bg-yellow-500'}`} />
+                                    {csvSSEConnected ? 'Connected to real-time updates' : 'Connecting...'}
+                                  </div>
+                                  
+                                  {/* Toggle Logs */}
+                                  <button
+                                    onClick={() => setShowCsvLogs(!showCsvLogs)}
+                                    className="text-xs text-purple-600 hover:text-purple-800 flex items-center gap-1"
+                                  >
+                                    <svg className={`w-3 h-3 transition-transform ${showCsvLogs ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                                    </svg>
+                                    {showCsvLogs ? 'Hide' : 'Show'} console logs ({csvLogs.length})
+                                  </button>
+                                  
+                                  {/* Console Logs */}
+                                  {showCsvLogs && (
+                                    <div className="mt-2 bg-slate-900 text-green-400 p-3 rounded-lg text-xs font-mono max-h-48 overflow-y-auto">
+                                      {csvLogs.map((log, idx) => (
+                                        <div key={idx} className="py-0.5">{log}</div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
 
                               {/* CSV Generated Results */}
                               {csvGeneratedResults.length > 0 && (

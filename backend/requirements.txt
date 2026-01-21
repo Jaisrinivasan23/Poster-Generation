@@ -2,6 +2,7 @@
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
 python-multipart==0.0.6
+sse-starlette==1.8.2
 
 # HTTP Clients
 httpx==0.26.0
@@ -32,3 +33,14 @@ pydantic-settings==2.1.0
 
 # Utilities
 python-dateutil==2.8.2
+
+# RedPanda / Kafka
+aiokafka==0.10.0
+
+# PostgreSQL
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+
+# Logging
+structlog==24.1.0
+python-json-logger==2.0.7

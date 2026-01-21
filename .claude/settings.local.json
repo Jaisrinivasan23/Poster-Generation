@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(playwright --version:*)",
+      "Bash(python test_bulk_generation.py:*)",
+      "Bash(python run_server.py:*)"
+    ]
+  }
+}

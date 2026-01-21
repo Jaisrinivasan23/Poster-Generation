@@ -1,16 +1,22 @@
 """
 Generate Bulk Router
-POST /api/generate-bulk - Bulk poster generation (CSV, HTML template, or AI prompt)
-"""
-from fastapi import APIRouter, HTTPException
-from app.models.poster import GenerateBulkRequest, GenerateBulkResponse, BulkGenerationResult
-from app.services.topmate_client import fetch_topmate_profile, fetch_profile_by_user_id, parse_user_identifiers
-from app.services.openrouter_client import fetch_image_as_data_url
-from app.services.image_processor import overlay_logo_and_profile, replace_placeholders
-from app.services.storage_service import upload_image
-from app.services.html_to_image import convert_html_to_png
-import asyncio
+POST /api/generate-bulk - Bulk poster generation via RedPanda batch processing
+GET /api/generate-bulk/{job_id}/stream - SSE stream for generation progress
 
+All bulk generation is processed via RedPanda queue for reliability and scalability.
+SSE is used for real-time progress tracking in the frontend.
+"""
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
+from sse_starlette.sse import EventSourceResponse
+from app.models.poster import GenerateBulkRequest, GenerateBulkResponse, BulkGenerationResult
+from app.services.topmate_client import parse_user_identifiers
+from app.services.job_manager import job_manager
+from app.services.sse_manager import sse_manager
+from app.services.database import database_service
+import structlog
+
+logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 # Poster size dimensions
@@ -25,246 +31,208 @@ POSTER_SIZE_DIMENSIONS = {
 }
 
 
-@router.post("/generate-bulk", response_model=GenerateBulkResponse)
+@router.post("/generate-bulk", response_model=None)
 async def generate_bulk(request: GenerateBulkRequest):
     """
-    Bulk poster generation
-
-    Supports 3 modes:
-    1. CSV Mode: Upload CSV + HTML template → batch generate
-    2. HTML Mode: HTML template + user identifiers → batch generate
-    3. Prompt Mode: AI generates template (returns 3 variants)
+    Bulk poster generation via RedPanda batch processing
+    
+    Supports 2 modes:
+    1. CSV Mode: Upload CSV + HTML template → batch generate via RedPanda
+    2. HTML Mode: HTML template + user identifiers → batch generate via RedPanda
+    
+    Returns job_id and SSE endpoint for real-time progress tracking.
+    All processing is handled by RedPanda workers for reliability.
     """
     try:
-        # Get dimensions
-        if request.size == "custom" and request.customWidth and request.customHeight:
-            dimensions = {"width": request.customWidth, "height": request.customHeight}
-        else:
-            dimensions = POSTER_SIZE_DIMENSIONS.get(request.size, POSTER_SIZE_DIMENSIONS["instagram-square"])
-
-        results = []
-
-        # CSV MODE: Use CSV data directly
+        print(f"\n{'='*60}")
+        print(f"🎨 [GENERATE-BULK] Received bulk generation request")
+        print(f"📊 [GENERATE-BULK] Mode: {request.bulkMethod}")
+        print(f"{'='*60}\n")
+        
+        # CSV MODE: Convert CSV data to user identifiers for RedPanda processing
         if request.bulkMethod == "csv" and request.csvTemplate and request.csvData and request.csvColumns:
-            print(f"[CSV] Processing {len(request.csvData)} rows")
-
-            # Process in batches of 8
-            BATCH_SIZE = 8
-            for i in range(0, len(request.csvData), BATCH_SIZE):
-                batch = request.csvData[i:i+BATCH_SIZE]
-                print(f"[CSV] Batch {i//BATCH_SIZE + 1}/{(len(request.csvData) + BATCH_SIZE - 1)//BATCH_SIZE}")
-
-                batch_tasks = []
-                for row in batch:
-                    batch_tasks.append(process_csv_row(
-                        row=row,
-                        csv_template=request.csvTemplate,
-                        csv_columns=request.csvColumns,
-                        dimensions=dimensions,
-                        skip_overlays=request.skipOverlays,
-                        topmate_logo=request.topmateLogo
-                    ))
-
-                batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-
-                for result in batch_results:
-                    if isinstance(result, Exception):
-                        print(f"[CSV] Error: {result}")
-                        results.append(BulkGenerationResult(
-                            username="unknown",
-                            success=False,
-                            error=str(result)
-                        ))
-                    else:
-                        results.append(result)
-
-                # Brief delay between batches
-                await asyncio.sleep(1)
-
-        # HTML MODE: Fetch profiles and use HTML template
+            print(f"📋 [CSV MODE] Processing {len(request.csvData)} CSV rows")
+            
+            # For CSV mode, we create the job with CSV data in metadata
+            job_result = await job_manager.create_csv_job(
+                campaign_name=f"CSV Bulk Generation",
+                csv_data=request.csvData,
+                csv_template=request.csvTemplate,
+                csv_columns=request.csvColumns,
+                poster_size=request.size,
+                model=request.model,
+                topmate_logo=request.topmateLogo,
+                skip_overlays=request.skipOverlays,
+                metadata={
+                    "bulk_method": "csv",
+                    "custom_width": request.customWidth,
+                    "custom_height": request.customHeight
+                }
+            )
+            
+            return JSONResponse(content={
+                "success": True,
+                "jobId": job_result["job_id"],
+                "status": job_result["status"],
+                "totalItems": job_result["total_items"],
+                "campaignName": job_result["campaign_name"],
+                "createdAt": job_result["created_at"],
+                "sseEndpoint": f"/api/batch/jobs/{job_result['job_id']}/stream",
+                "message": "🔴 Job queued for RedPanda processing. Connect to SSE endpoint for live progress."
+            })
+        
+        # HTML MODE: Use HTML template with user identifiers
         elif request.bulkMethod == "html" and request.htmlTemplate and request.userIdentifiers:
-            print(f"[HTML] Using HTML template mode")
-
-            # Parse identifiers
-            usernames, user_ids = parse_user_identifiers(request.userIdentifiers)
-            print(f"[HTML] Parsed: {len(usernames)} usernames, {len(user_ids)} user IDs")
-
-            # Fetch profiles
-            profiles = []
-            for username in usernames:
-                try:
-                    profile = await fetch_topmate_profile(username)
-                    profiles.append(profile)
-                except Exception as e:
-                    print(f"[ERROR] Failed to fetch {username}: {e}")
-
-            for user_id in user_ids:
-                try:
-                    profile = await fetch_profile_by_user_id(user_id)
-                    profiles.append(profile)
-                except Exception as e:
-                    print(f"[ERROR] Failed to fetch user {user_id}: {e}")
-
-            # Process in batches
-            BATCH_SIZE = 8
-            for i in range(0, len(profiles), BATCH_SIZE):
-                batch = profiles[i:i+BATCH_SIZE]
-
-                batch_tasks = []
-                for profile in batch:
-                    batch_tasks.append(process_html_template(
-                        profile=profile,
-                        html_template=request.htmlTemplate,
-                        dimensions=dimensions,
-                        topmate_logo=request.topmateLogo
-                    ))
-
-                batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-
-                for result in batch_results:
-                    if isinstance(result, Exception):
-                        print(f"[ERROR] Error: {result}")
-                    else:
-                        results.append(result)
-
-                await asyncio.sleep(1)
-
+            print(f"📋 [HTML MODE] Using HTML template with user identifiers")
+            
+            # Create job via job_manager (goes through RedPanda)
+            job_result = await job_manager.create_job(
+                campaign_name=f"Bulk Generation",
+                user_identifiers=request.userIdentifiers,
+                html_template=request.htmlTemplate,
+                poster_size=request.size,
+                model=request.model,
+                topmate_logo=request.topmateLogo,
+                skip_overlays=request.skipOverlays,
+                metadata={
+                    "bulk_method": "html",
+                    "custom_width": request.customWidth,
+                    "custom_height": request.customHeight
+                }
+            )
+            
+            return JSONResponse(content={
+                "success": True,
+                "jobId": job_result["job_id"],
+                "status": job_result["status"],
+                "totalItems": job_result["total_items"],
+                "campaignName": job_result["campaign_name"],
+                "createdAt": job_result["created_at"],
+                "sseEndpoint": f"/api/batch/jobs/{job_result['job_id']}/stream",
+                "message": "🔴 Job queued for RedPanda processing. Connect to SSE endpoint for live progress."
+            })
+        
         else:
-            raise HTTPException(status_code=400, detail="Invalid bulk generation request")
+            raise HTTPException(status_code=400, detail="Invalid bulk generation request. Provide either CSV data or HTML template with user identifiers.")
 
-        success_count = sum(1 for r in results if r.success)
-        failure_count = len(results) - success_count
-
-        return GenerateBulkResponse(
-            success=True,
-            results=results,
-            successCount=success_count,
-            failureCount=failure_count
-        )
-
+    except ValueError as e:
+        print(f"❌ [GENERATE-BULK] Validation error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
+        print(f"❌ [GENERATE-BULK] Failed to create job: {e}")
+        logger.error("Failed to create bulk generation job", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def process_csv_row(
-    row: dict,
-    csv_template: str,
-    csv_columns: list[str],
-    dimensions: dict,
-    skip_overlays: bool,
-    topmate_logo: str | None
-) -> BulkGenerationResult:
-    """Process a single CSV row"""
+@router.get("/generate-bulk/{job_id}/stream")
+async def stream_generation_progress(job_id: str, request: Request):
+    """
+    SSE endpoint for generation job progress.
+    Proxies to the main SSE manager which handles all job types.
+    """
+    print(f"📡 [SSE] Client connecting to stream for job: {job_id}")
+    
+    async def event_generator():
+        async for event in sse_manager.subscribe(job_id):
+            if await request.is_disconnected():
+                print(f"📡 [SSE] Client disconnected from job: {job_id}")
+                break
+            yield event
+    
+    return EventSourceResponse(event_generator())
+
+
+@router.get("/generate-bulk/{job_id}/status")
+async def get_generation_job_status(job_id: str):
+    """Get current status of a generation job"""
     try:
-        username = row.get("username") or row.get("Username") or "unknown"
-        print(f"[CSV] Generating for {username}...")
-
-        # Replace placeholders
-        filled_html = replace_placeholders(csv_template, row, csv_columns)
-
-        # Convert HTML to PNG using Playwright
-        print(f"[CSV] Converting HTML to PNG for {username}...")
-        png_data_url = await convert_html_to_png(
-            html=filled_html,
-            dimensions=dimensions,
-            scale=1.0  # 1x resolution for faster processing
-        )
-        print(f"[CSV] Converted HTML to PNG for {username}")
-
-        # Apply overlays if not skipped
-        if not skip_overlays and topmate_logo:
-            print(f"[CSV] Applying logo overlay for {username}...")
-            png_data_url = await overlay_logo_and_profile(
-                base_image_url=png_data_url,
-                logo_url=topmate_logo,
-                profile_pic_url=None,  # No profile pic for CSV mode
-                dimensions=dimensions
-            )
-            print(f"[CSV] Completed image with overlays for {username}")
-
-        # Upload to S3
-        filename = f"{username}-{int(__import__('time').time() * 1000)}.png"
-        uploaded_url = await upload_image(png_data_url, filename)
-        print(f"[CSV] Uploaded to S3: {uploaded_url}")
-
-        return BulkGenerationResult(
-            username=username,
-            imageUrl=uploaded_url,
-            posterUrl=uploaded_url,
-            success=True
-        )
-
+        job = await database_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        stats = await database_service.get_job_statistics(job_id)
+        
+        return {
+            "success": True,
+            "jobId": job_id,
+            "status": job.get("status"),
+            "total": job.get("total_items", 0),
+            "processed": job.get("processed_items", 0),
+            "success_count": job.get("success_count", 0),
+            "failure_count": job.get("failure_count", 0),
+            "percent": round((job.get("processed_items", 0) / max(job.get("total_items", 1), 1)) * 100, 1),
+            "campaignName": job.get("campaign_name"),
+            "createdAt": job.get("created_at").isoformat() if job.get("created_at") else None,
+            "startedAt": job.get("started_at").isoformat() if job.get("started_at") else None,
+            "completedAt": job.get("completed_at").isoformat() if job.get("completed_at") else None,
+            "statistics": stats
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        import traceback
-        username = row.get("username") or row.get("Username") or "unknown"
-        error_msg = str(e) or "Unknown error"
-        print(f"[CSV] Failed for {username}: {error_msg}")
-        print(f"[CSV] Traceback: {traceback.format_exc()}")
-        return BulkGenerationResult(
-            username=username,
-            success=False,
-            error=error_msg
-        )
+        logger.error("Failed to get job status", job_id=job_id, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-async def process_html_template(
-    profile: any,
-    html_template: str,
-    dimensions: dict,
-    topmate_logo: str | None
-) -> BulkGenerationResult:
-    """Process HTML template for a profile"""
+@router.get("/generate-bulk/{job_id}/results")
+async def get_generation_job_results(job_id: str):
+    """Get all results (posters) for a completed job"""
     try:
-        print(f"[HTML] Generating for {profile.username}...")
-
-        # Replace placeholders
-        filled_html = html_template
-        filled_html = filled_html.replace("{display_name}", profile.display_name)
-        filled_html = filled_html.replace("{username}", profile.username)
-        filled_html = filled_html.replace("{profile_pic}", profile.profile_pic)
-        filled_html = filled_html.replace("{bio}", profile.bio)
-        filled_html = filled_html.replace("{total_bookings}", str(profile.total_bookings))
-        filled_html = filled_html.replace("{average_rating}", str(profile.average_rating))
-
-        # Convert HTML to PNG
-        print(f"[HTML] Converting HTML to PNG for {profile.username}...")
-        png_data_url = await convert_html_to_png(
-            html=filled_html,
-            dimensions=dimensions,
-            scale=1.0
-        )
-        print(f"[HTML] Converted HTML to PNG for {profile.username}")
-
-        # Apply overlays (logo + profile picture)
-        print(f"[HTML] Applying logo and profile overlays for {profile.username}...")
-        final_image_url = await overlay_logo_and_profile(
-            base_image_url=png_data_url,
-            logo_url=topmate_logo,
-            profile_pic_url=profile.profile_pic,
-            dimensions=dimensions
-        )
-        print(f"[HTML] Completed image with overlays for {profile.username}")
-
-        # Upload to S3
-        filename = f"{profile.username}-{int(__import__('time').time() * 1000)}.png"
-        uploaded_url = await upload_image(final_image_url, filename)
-        print(f"[HTML] Uploaded to S3: {uploaded_url}")
-
-        return BulkGenerationResult(
-            userId=profile.user_id,
-            username=profile.username,
-            imageUrl=uploaded_url,
-            posterUrl=uploaded_url,
-            success=True
-        )
-
+        job = await database_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        posters = await database_service.get_job_posters(job_id)
+        
+        results = []
+        failures = []
+        
+        for poster in posters:
+            if poster.get("status") == "completed":
+                results.append({
+                    "username": poster.get("username"),
+                    "userId": poster.get("user_identifier"),
+                    "posterUrl": poster.get("poster_url"),
+                    "imageUrl": poster.get("poster_url"),
+                    "success": True
+                })
+            else:
+                failures.append({
+                    "username": poster.get("username"),
+                    "userId": poster.get("user_identifier"),
+                    "error": poster.get("error_message"),
+                    "success": False
+                })
+        
+        return {
+            "success": True,
+            "jobId": job_id,
+            "status": job.get("status"),
+            "results": results,
+            "failures": failures,
+            "successCount": len(results),
+            "failureCount": len(failures)
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"[HTML] Failed for {profile.username}: {e}")
-        return BulkGenerationResult(
-            userId=profile.user_id,
-            username=profile.username,
-            success=False,
-            error=str(e)
-        )
+        logger.error("Failed to get job results", job_id=job_id, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/generate-bulk/{job_id}")
+async def cancel_generation_job(job_id: str):
+    """Cancel a running generation job"""
+    try:
+        success = await job_manager.cancel_job(job_id)
+        if success:
+            return {"success": True, "message": f"Job {job_id} cancelled"}
+        else:
+            raise HTTPException(status_code=400, detail="Job could not be cancelled")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to cancel job", job_id=job_id, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
