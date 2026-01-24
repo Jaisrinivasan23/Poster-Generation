@@ -5,7 +5,7 @@ Handles S3 uploads and local file storage
 import boto3
 import io
 import base64
-from typing import Optional
+from typing import Optional, Dict
 from app.config import settings
 
 
@@ -66,26 +66,32 @@ def data_url_to_bytes(data_url: str) -> bytes:
     return base64.b64decode(base64_data)
 
 
-async def upload_image(data_url: str, filename: str) -> str:
+async def upload_image(image_bytes: bytes = None, data_url: str = None, filename: str = None) -> Dict[str, str]:
     """
     Upload image (to S3 or local storage)
 
     Args:
-        data_url: Image as data URL
+        image_bytes: Image as bytes (optional)
+        data_url: Image as data URL (optional, used if image_bytes not provided)
         filename: Filename
 
     Returns:
-        URL to uploaded image
+        Dict with 'url' and 'key' of uploaded image
     """
-    # Convert data URL to bytes
-    image_bytes = data_url_to_bytes(data_url)
+    # Get bytes from either parameter
+    if image_bytes is None:
+        if data_url is None:
+            raise ValueError("Either image_bytes or data_url must be provided")
+        image_bytes = data_url_to_bytes(data_url)
 
     # Upload to S3
     if is_s3_configured():
         print("    [S3] Uploading to S3...")
-        return await upload_to_s3(image_bytes, filename)
+        s3_url = await upload_to_s3(image_bytes, filename)
+        return {"url": s3_url, "key": filename}
     else:
-        # For local development, could save to local storage
-        # For now, just return the data URL (frontend will handle)
+        # For local development, convert bytes to data URL
         print("    [S3] S3 not configured, returning data URL")
-        return data_url
+        image_base64 = base64.b64encode(image_bytes).decode()
+        local_url = f"data:image/png;base64,{image_base64}"
+        return {"url": local_url, "key": filename}

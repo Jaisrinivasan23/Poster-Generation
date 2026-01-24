@@ -166,7 +166,7 @@ export interface PosterGenerationResponse {
 }
 
 // Bulk Generation Types
-export type PosterFlowMode = 'single' | 'bulk';
+export type PosterFlowMode = 'single' | 'bulk' | 'template';
 
 export interface BulkGenerationConfig {
   prompt: string;

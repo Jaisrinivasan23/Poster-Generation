@@ -10,6 +10,7 @@ from app.models.poster import SaveBulkPostersRequest, SaveBulkPostersResponse, S
 from app.services.topmate_client import fetch_topmate_profile
 from app.services.storage_service import upload_image
 from app.services.webhook_service import store_poster_to_django
+from app.services.database import database_service
 import asyncio
 import uuid
 import json
@@ -157,10 +158,116 @@ async def get_save_job_status(job_id: str):
     }
 
 
+async def _process_single_save(poster, poster_name: str, job: Dict, add_log, save_job_id: str):
+    """Process a single poster save (for parallel execution)"""
+    try:
+        username = poster.username or "unknown"
+        poster_url = poster.posterUrl
+        add_log("INFO", f"Saving poster for: {username}")
+
+        # Check if user_id is provided (should be from CSV/database)
+        user_id = None
+        if poster.userId:
+            user_id = int(poster.userId)
+            add_log("INFO", f"Using userId: {user_id}", {"username": username})
+        else:
+            # No user_id provided - this shouldn't happen if CSV has user_id column
+            error_msg = "No user_id provided. Please upload CSV with 'user_id' column."
+            add_log("ERROR", f"Skipping {username} - {error_msg}")
+            job["failed"] += 1
+            job["processed"] += 1
+            job["failures"].append({
+                "username": username,
+                "error": error_msg
+            })
+            # Save failure to database
+            try:
+                await database_service.log_save_failure(
+                    save_job_id=save_job_id,
+                    username=username,
+                    poster_url=poster_url,
+                    error_message=error_msg,
+                    error_type="missing_user_id"
+                )
+            except Exception as db_err:
+                add_log("WARNING", f"Failed to log save failure to DB: {db_err}")
+            return
+
+        # Upload image if data URL
+        final_url = poster.posterUrl
+        if poster.posterUrl.startswith("data:image/"):
+            add_log("INFO", f"Uploading image for {username}...")
+            filename = f"{username}-{int(__import__('time').time() * 1000)}.png"
+            final_url = await upload_image(poster.posterUrl, filename)
+            add_log("SUCCESS", f"Uploaded to S3: {final_url[:50]}...", {"username": username})
+
+        # Store to Django via webhook
+        add_log("INFO", f"Storing to Topmate DB for {username}...")
+        result = await store_poster_to_django(
+            poster_url=final_url,
+            poster_name=poster_name,
+            user_id=user_id
+        )
+
+        if result.get("success"):
+            job["success"] += 1
+            job["results"].append({
+                "username": username,
+                "userId": user_id,
+                "posterUrl": final_url,
+                "success": True
+            })
+            add_log("SUCCESS", f"Saved to Topmate DB: {username}", {"userId": user_id})
+        else:
+            error_msg = result.get("error", "Unknown webhook error")
+            job["failed"] += 1
+            job["failures"].append({
+                "username": username,
+                "userId": user_id,
+                "error": error_msg
+            })
+            add_log("ERROR", f"Failed to save to Topmate DB: {error_msg}", {"username": username})
+            # Save failure to database
+            try:
+                await database_service.log_save_failure(
+                    save_job_id=save_job_id,
+                    username=username,
+                    poster_url=final_url,
+                    error_message=error_msg,
+                    error_type="webhook_failed"
+                )
+            except Exception as db_err:
+                add_log("WARNING", f"Failed to log save failure to DB: {db_err}")
+
+        job["processed"] += 1
+
+    except Exception as e:
+        username = poster.username or "unknown"
+        error_msg = str(e)
+        add_log("ERROR", f"Failed to process {username}: {error_msg}")
+        job["failed"] += 1
+        job["processed"] += 1
+        job["failures"].append({
+            "username": username,
+            "error": error_msg
+        })
+        # Save failure to database
+        try:
+            await database_service.log_save_failure(
+                save_job_id=save_job_id,
+                username=username,
+                poster_url=poster.posterUrl,
+                error_message=error_msg,
+                error_type="unexpected_error"
+            )
+        except Exception as db_err:
+            add_log("WARNING", f"Failed to log save failure to DB: {db_err}")
+
+
 async def _process_save_job(job_id: str, request: SaveBulkPostersRequest):
     """Background task to process save job"""
     job = save_jobs[job_id]
-    
+
     def add_log(level: str, message: str, details: Dict = None):
         log_entry = {
             "level": level,
@@ -173,113 +280,33 @@ async def _process_save_job(job_id: str, request: SaveBulkPostersRequest):
         print(f"{emoji} [SAVE-JOB {job_id}] {message}")
     
     try:
-        # Process in batches with rate limiting
+        # Process in PARALLEL batches (fast since user_id is from CSV/database, no API lookups!)
         BATCH_SIZE = 10
-        DELAY_BETWEEN_BATCHES = 3  # seconds
-        DELAY_BETWEEN_REQUESTS = 1  # seconds
-        
+        DELAY_BETWEEN_BATCHES = 2  # seconds
+
         posters = request.posters
         total_batches = (len(posters) + BATCH_SIZE - 1) // BATCH_SIZE
-        
-        add_log("INFO", f"Starting batch processing: {len(posters)} posters in {total_batches} batches")
-        
+
+        add_log("INFO", f"Starting PARALLEL processing: {len(posters)} posters in {total_batches} batches")
+
         for batch_idx in range(0, len(posters), BATCH_SIZE):
             batch = posters[batch_idx:batch_idx + BATCH_SIZE]
             batch_num = batch_idx // BATCH_SIZE + 1
-            
-            add_log("INFO", f"Processing batch {batch_num}/{total_batches} ({len(batch)} posters)")
-            
+
+            add_log("INFO", f"[Batch {batch_num}/{total_batches}] Processing {len(batch)} posters in PARALLEL")
+
+            # Create tasks for parallel processing
+            tasks = []
             for poster in batch:
-                try:
-                    username = poster.username or "unknown"
-                    add_log("INFO", f"Saving poster for: {username}")
-                    
-                    # Lookup user_id if not provided
-                    user_id = None
-                    if poster.userId:
-                        user_id = int(poster.userId)
-                        add_log("INFO", f"Using provided userId: {user_id}", {"username": username})
-                    else:
-                        # Lookup with retry logic
-                        add_log("INFO", f"Looking up userId for {username}")
-                        MAX_RETRIES = 5
-                        for retry in range(MAX_RETRIES):
-                            try:
-                                profile = await fetch_topmate_profile(username)
-                                if profile and profile.user_id:
-                                    user_id = int(profile.user_id)
-                                    add_log("SUCCESS", f"Found userId: {user_id}", {"username": username})
-                                    break
-                            except Exception as e:
-                                if "429" in str(e):  # Rate limit
-                                    backoff_delay = min(30, 5 * (2 ** retry))
-                                    add_log("WARNING", f"Rate limited. Retry {retry+1}/{MAX_RETRIES} after {backoff_delay}s", {"username": username})
-                                    await asyncio.sleep(backoff_delay)
-                                else:
-                                    add_log("ERROR", f"Lookup failed: {e}", {"username": username})
-                                    break
-                        
-                        if not user_id:
-                            add_log("ERROR", f"Skipping {username} - no user_id found")
-                            job["failed"] += 1
-                            job["processed"] += 1
-                            job["failures"].append({
-                                "username": username,
-                                "error": "Failed to lookup user_id"
-                            })
-                            continue
-                        
-                        await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
-                    
-                    # Upload image if data URL
-                    final_url = poster.posterUrl
-                    if poster.posterUrl.startswith("data:image/"):
-                        add_log("INFO", f"Uploading image for {username}...")
-                        filename = f"{username}-{int(__import__('time').time() * 1000)}.png"
-                        final_url = await upload_image(poster.posterUrl, filename)
-                        add_log("SUCCESS", f"Uploaded to S3: {final_url[:50]}...", {"username": username})
-                    
-                    # Store to Django via webhook
-                    add_log("INFO", f"Storing to Topmate DB for {username}...")
-                    result = await store_poster_to_django(
-                        poster_url=final_url,
-                        poster_name=request.posterName,
-                        user_id=user_id
-                    )
-                    
-                    if result.get("success"):
-                        job["success"] += 1
-                        job["results"].append({
-                            "username": username,
-                            "userId": user_id,
-                            "posterUrl": final_url,
-                            "success": True
-                        })
-                        add_log("SUCCESS", f"Saved to Topmate DB: {username}", {"userId": user_id})
-                    else:
-                        job["failed"] += 1
-                        job["failures"].append({
-                            "username": username,
-                            "userId": user_id,
-                            "error": result.get("error", "Unknown webhook error")
-                        })
-                        add_log("ERROR", f"Failed to save to Topmate DB: {result.get('error')}", {"username": username})
-                    
-                    job["processed"] += 1
-                    
-                except Exception as e:
-                    username = poster.username or "unknown"
-                    add_log("ERROR", f"Failed to process {username}: {str(e)}")
-                    job["failed"] += 1
-                    job["processed"] += 1
-                    job["failures"].append({
-                        "username": username,
-                        "error": str(e)
-                    })
-            
-            # Delay between batches
+                task = _process_single_save(poster, request.posterName, job, add_log, job_id)
+                tasks.append(task)
+
+            # Execute batch in parallel
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Small delay between batches to avoid overwhelming Django
             if batch_idx + BATCH_SIZE < len(posters):
-                add_log("INFO", f"Batch {batch_num} complete. Waiting {DELAY_BETWEEN_BATCHES}s before next batch...")
+                add_log("INFO", f"Batch {batch_num} complete. Waiting {DELAY_BETWEEN_BATCHES}s...")
                 await asyncio.sleep(DELAY_BETWEEN_BATCHES)
         
         # Mark job as completed

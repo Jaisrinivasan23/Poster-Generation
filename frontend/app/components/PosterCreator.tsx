@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import Papa from 'papaparse';
 import {
   PosterConfig,
@@ -11,7 +12,7 @@ import {
   POSTER_SIZE_DIMENSIONS,
   GeneratedPoster,
 } from '../types/poster';
-import { TEMPLATE_IMAGES } from '../lib/templates';
+import { TEMPLATE_IMAGES, getAllTemplates, fetchCustomFonts, type Template, type CustomFont } from '../lib/templates';
 import TopmateShare from './TopmateShare';
 import { PosterFlowMode } from '../types/poster';
 import { getTopmateLogo } from '../lib/topmate-logo';
@@ -28,12 +29,14 @@ interface PosterCreatorProps {
 }
 
 export default function PosterCreator({ onBack }: PosterCreatorProps) {
+  const router = useRouter();
+
   // User mode state (Expert/Admin)
   const [userMode, setUserMode] = useState<'expert' | 'admin'>('admin');
 
   // Flow mode state
   const [flowMode, setFlowMode] = useState<PosterFlowMode>('single');
-  const [bulkMethod, setBulkMethod] = useState<'prompt' | 'csv'>('prompt'); // Bulk generation method
+  const [bulkMethod] = useState<'csv'>('csv'); // Bulk generation method - CSV only
 
   // Simple form state
   const [topmateUsername, setTopmateUsername] = useState('');
@@ -59,9 +62,23 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
   const [csvCustomHeight, setCsvCustomHeight] = useState(1350);
   const [showConvertedTemplate, setShowConvertedTemplate] = useState(false);
   const [csvSkipOverlays, setCsvSkipOverlays] = useState(true); // Default to true since users typically include logo in template
+  const [csvMissingUserId, setCsvMissingUserId] = useState(false); // Track if CSV is missing user_id column
   const [csvSaveSuccess, setCsvSaveSuccess] = useState(false);
   const [csvSavedConfig, setCsvSavedConfig] = useState<{campaign: string, content_type: string} | null>(null);
-  
+  const [csvSaveProgress, setCsvSaveProgress] = useState<{processed: number, total: number, success: number, failed: number} | null>(null);
+
+  // Template mode states (for external backend integration)
+  const [templateSection, setTemplateSection] = useState('');
+  const [templateName, setTemplateName] = useState('');
+  const [templateHtml, setTemplateHtml] = useState('');
+  const [templateCss, setTemplateCss] = useState('');
+  const [templatePreviewData, setTemplatePreviewData] = useState('{}');
+  const [templateSetActive, setTemplateSetActive] = useState(true);
+  const [isUploadingTemplate, setIsUploadingTemplate] = useState(false);
+  const [templateUploadSuccess, setTemplateUploadSuccess] = useState<any>(null);
+  const [templateList, setTemplateList] = useState<any[]>([]);
+  const [selectedTemplateSection, setSelectedTemplateSection] = useState('testimonial');
+
   // SSE Progress tracking for CSV mode
   const [csvJobId, setCsvJobId] = useState<string | null>(null);
   const [csvProgress, setCsvProgress] = useState({ processed: 0, total: 0, percentage: 0 });
@@ -77,6 +94,20 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
   const [slideCount, setSlideCount] = useState(5);
   const [selectedModel, setSelectedModel] = useState<'pro' | 'flash'>('pro');
   const [generationMode, setGenerationMode] = useState<GenerationMode>('html'); // HTML or Image generation
+
+  // Dynamic templates and fonts
+  const [allTemplates, setAllTemplates] = useState<Template[]>(TEMPLATE_IMAGES);
+  const [customFonts, setCustomFonts] = useState<CustomFont[]>([]);
+  const [isLoadingTemplates, setIsLoadingTemplates] = useState(false);
+
+  // Admin upload states
+  const [showAdminUpload, setShowAdminUpload] = useState(false);
+  const [uploadingTemplate, setUploadingTemplate] = useState(false);
+  const [uploadingFont, setUploadingFont] = useState(false);
+  const [newTemplateName, setNewTemplateName] = useState('');
+  const [newTemplateCategory, setNewTemplateCategory] = useState<'minimal' | 'bold' | 'gradient' | 'photo'>('minimal');
+  const [newFontName, setNewFontName] = useState('');
+  const [newFontFamily, setNewFontFamily] = useState('');
 
   // Generation state
   const [isLoading, setIsLoading] = useState(false);
@@ -173,6 +204,26 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
     }
   }, [userMode]);
 
+  // Check for edited posters returning from edit page
+  useEffect(() => {
+    const storedPosters = localStorage.getItem('posters');
+    if (storedPosters) {
+      try {
+        const parsedPosters = JSON.parse(storedPosters);
+        if (Array.isArray(parsedPosters) && parsedPosters.length > 0) {
+          // Check if these are different from current posters
+          if (JSON.stringify(parsedPosters) !== JSON.stringify(posters) && parsedPosters[0]?.html) {
+            setPosters(parsedPosters);
+            localStorage.removeItem('posters'); // Clean up
+          }
+        }
+      } catch (error) {
+        console.error('Failed to load edited posters:', error);
+      }
+    }
+  }, []); // Only run on mount
+
+
   // Handle CSV file upload and parsing
   const handleCsvUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -192,6 +243,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
       complete: (results) => {
         if (!results.data || results.data.length === 0) {
           setError('CSV file must have at least one data row');
+          setCsvMissingUserId(false);
           return;
         }
 
@@ -199,22 +251,48 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
         const headers = Object.keys(results.data[0] as any);
         setCsvColumns(headers);
 
+        // user_id is now OPTIONAL - will fetch from Topmate API during generation if not provided
+        const hasUserId = headers.some(h =>
+          h.toLowerCase() === 'user_id' ||
+          h.toLowerCase() === 'userid' ||
+          h === 'User_ID'
+        );
+
+        if (!hasUserId) {
+          setCsvMissingUserId(false);
+          console.log('ℹ️ CSV does not have user_id - will fetch from Topmate API during generation');
+        } else {
+          setCsvMissingUserId(false);
+          console.log('✅ CSV has user_id column - will use provided user_id');
+        }
+        setError(null);
+
         // Set the parsed data
         setCsvData(results.data as any[]);
         console.log('📊 [CSV] Parsed CSV with Papa Parse:', {
           headers,
           rowCount: results.data.length,
-          sample: results.data[0]
+          sample: results.data[0],
+          hasUserId
         });
-
-        // Clear any previous errors
-        setError(null);
       },
       error: (error) => {
         console.error('❌ [CSV] Parse error:', error);
         setError(`Failed to parse CSV: ${error.message}`);
+        setCsvMissingUserId(false);
       }
     });
+  };
+
+  // Clear CSV and allow re-upload
+  const handleClearCsv = () => {
+    setCsvFile(null);
+    setCsvData([]);
+    setCsvColumns([]);
+    setCsvTemplate('');
+    setCsvPreview('');
+    setCsvMissingUserId(false);
+    setError(null);
   };
 
   // Handle image upload
@@ -265,6 +343,109 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
     } catch (err) {
       console.error('Template load error:', err);
       setError('Failed to load template image. Try uploading instead.');
+    }
+  };
+
+  // Load dynamic templates and fonts
+  useEffect(() => {
+    const loadResources = async () => {
+      setIsLoadingTemplates(true);
+      try {
+        const templates = await getAllTemplates();
+        const fonts = await fetchCustomFonts();
+        setAllTemplates(templates);
+        setCustomFonts(fonts);
+      } catch (error) {
+        console.error('Failed to load resources:', error);
+      } finally {
+        setIsLoadingTemplates(false);
+      }
+    };
+    loadResources();
+  }, []);
+
+  // Admin: Upload template image
+  const handleUploadTemplate = async (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      alert('Please upload an image file');
+      return;
+    }
+
+    setUploadingTemplate(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('name', newTemplateName || file.name);
+      formData.append('category', newTemplateCategory);
+      formData.append('uploaded_by', 'admin');
+
+      const response = await fetch(`${BACKEND_URL}/api/template-images/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      const data = await response.json();
+      if (data.success) {
+        // Reload templates
+        const templates = await getAllTemplates();
+        setAllTemplates(templates);
+        setNewTemplateName('');
+        alert('Template uploaded successfully!');
+      } else {
+        throw new Error(data.message || 'Upload failed');
+      }
+    } catch (error) {
+      console.error('Template upload error:', error);
+      alert('Failed to upload template');
+    } finally {
+      setUploadingTemplate(false);
+    }
+  };
+
+  // Admin: Upload custom font
+  const handleUploadFont = async (file: File) => {
+    const ext = file.name.split('.').pop()?.toLowerCase();
+    const validFormats = ['ttf', 'woff', 'woff2', 'otf'];
+    
+    if (!ext || !validFormats.includes(ext)) {
+      alert(`Invalid font format. Supported: ${validFormats.join(', ')}`);
+      return;
+    }
+
+    if (!newFontFamily.trim()) {
+      alert('Please enter a font family name');
+      return;
+    }
+
+    setUploadingFont(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('font_name', newFontName || file.name);
+      formData.append('font_family', newFontFamily);
+      formData.append('uploaded_by', 'admin');
+
+      const response = await fetch(`${BACKEND_URL}/api/custom-fonts/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      const data = await response.json();
+      if (data.success) {
+        // Reload fonts
+        const fonts = await fetchCustomFonts();
+        setCustomFonts(fonts);
+        setNewFontName('');
+        setNewFontFamily('');
+        alert('Font uploaded successfully!');
+      } else {
+        throw new Error(data.message || 'Upload failed');
+      }
+    } catch (error) {
+      console.error('Font upload error:', error);
+      alert('Failed to upload font');
+    } finally {
+      setUploadingFont(false);
     }
   };
 
@@ -400,12 +581,6 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
       return;
     }
 
-    // Validation for prompt mode
-    if (flowMode === 'bulk' && bulkMethod === 'prompt' && !prompt.trim()) {
-      setError('Please describe what poster you want');
-      return;
-    }
-
     // Validation for single mode
     if (flowMode === 'single' && !prompt.trim()) {
       setError('Please describe what poster you want');
@@ -419,34 +594,8 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
     const topmateLogo = getTopmateLogo();
 
     try {
-      // BULK MODE - PROMPT: Generate template with dummy data (no field analysis)
-      if (flowMode === 'bulk' && bulkMethod === 'prompt') {
-        const response = await apiFetch('/api/generate-template', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            prompt: prompt.trim() + (referenceImage ? '\n\nUse the uploaded reference image as design inspiration.' : ''),
-            size: 'instagram-square' as PosterSize,
-            model: selectedModel,
-            referenceImage: referenceImage || undefined,
-            topmateLogo: topmateLogo, // Logo for branding
-          }),
-        });
-
-        const data = await response.json();
-
-        if (!response.ok) {
-          throw new Error(data.error || 'Template generation failed');
-        }
-
-        // Set templates as posters (3 variants with dummy data)
-        setPosters(data.templates);
-        setSelectedIndex(0);
-        setCarousels([]);
-        setResultMode('single');
-      }
       // SINGLE MODE: Generate with real profile
-      else {
+      if (flowMode === 'single') {
         const config: PosterConfig = {
           topmateUsername: topmateUsername.trim(),
           style: 'professional' as PosterStyle,
@@ -749,6 +898,40 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
     }
   };
 
+  // Navigate to dedicated edit page
+  const handleOpenEditPage = () => {
+    // Get current poster based on mode
+    let currentPoster: GeneratedPoster | null = null;
+    let posterIdx = 0;
+
+    if (resultMode === 'single') {
+      currentPoster = posters[selectedIndex] || null;
+      posterIdx = selectedIndex;
+    } else if (resultMode === 'carousel') {
+      currentPoster = carousels[selectedVariant]?.[selectedSlide] || null;
+      posterIdx = selectedSlide;
+    }
+
+    if (!currentPoster) {
+      setError('No poster available to edit');
+      return;
+    }
+
+    // Store poster data in localStorage for the edit page
+    localStorage.setItem('editingPoster', JSON.stringify(currentPoster));
+    localStorage.setItem('editingPosterIndex', posterIdx.toString());
+
+    // Store all posters for saving back later
+    if (resultMode === 'single') {
+      localStorage.setItem('posters', JSON.stringify(posters));
+    } else {
+      localStorage.setItem('posters', JSON.stringify(carousels[selectedVariant] || []));
+    }
+
+    // Navigate to edit page
+    router.push('/edit-poster');
+  };
+
   // Handle click inside iframe to select element
   const handleIframeClick = (e: MouseEvent) => {
     if (!isEditMode) return;
@@ -970,44 +1153,62 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
         <div className="max-w-5xl mx-auto px-4 py-4">
           <div className="flex items-center justify-between gap-4">
             <div className="flex items-center gap-4">
-              {onBack && (
-                <button
-                  onClick={onBack}
-                  className="p-2 hover:bg-slate-100 rounded-lg transition-colors"
-                >
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-                  </svg>
-                </button>
-              )}
               <div>
                 <h1 className="text-xl font-bold text-slate-900">Poster Creator</h1>
                 <p className="text-sm text-slate-500">Create posters from Topmate profiles</p>
               </div>
             </div>
 
-            {/* User Mode Toggle */}
-            <div className="flex items-center gap-2 bg-slate-100 rounded-lg p-1">
-              <button
-                onClick={() => setUserMode('expert')}
-                className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${
-                  userMode === 'expert'
-                    ? 'bg-white text-slate-900 shadow-sm'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Expert
-              </button>
-              <button
-                onClick={() => setUserMode('admin')}
-                className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${
-                  userMode === 'admin'
-                    ? 'bg-white text-slate-900 shadow-sm'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Admin
-              </button>
+            <div className="flex items-center gap-3">
+              {/* Templates Button - Only show in Admin mode */}
+              {userMode === 'admin' && (
+                <>
+                  <button
+                    onClick={() => router.push('/templates')}
+                    className="px-4 py-2 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white rounded-lg text-sm font-medium transition-all flex items-center gap-2 shadow-sm"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    Templates
+                  </button>
+                  
+                  {/* Upload Button */}
+                  <button
+                    onClick={() => setShowAdminUpload(true)}
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-medium transition-all flex items-center gap-2 shadow-sm"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                    </svg>
+                    Upload
+                  </button>
+                </>
+              )}
+
+              {/* User Mode Toggle */}
+              <div className="flex items-center gap-2 bg-slate-100 rounded-lg p-1">
+                <button
+                  onClick={() => setUserMode('expert')}
+                  className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${
+                    userMode === 'expert'
+                      ? 'bg-white text-slate-900 shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Expert
+                </button>
+                <button
+                  onClick={() => setUserMode('admin')}
+                  className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${
+                    userMode === 'admin'
+                      ? 'bg-white text-slate-900 shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Admin
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -1018,10 +1219,10 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
         <div className="max-w-5xl mx-auto px-4 pt-6 pb-2">
           <div className="bg-white rounded-lg shadow-sm border border-slate-200 p-4">
             <label className="block text-sm font-medium text-slate-700 mb-3">Generation Flow</label>
-            <div className="flex gap-3">
+            <div className="grid grid-cols-3 gap-3">
               <button
                 onClick={() => setFlowMode('single')}
-                className={`flex-1 px-6 py-3 rounded-lg font-medium transition ${
+                className={`px-6 py-3 rounded-lg font-medium transition ${
                   flowMode === 'single'
                     ? 'bg-blue-600 text-white'
                     : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
@@ -1031,7 +1232,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
               </button>
               <button
                 onClick={() => setFlowMode('bulk')}
-                className={`flex-1 px-6 py-3 rounded-lg font-medium transition ${
+                className={`px-6 py-3 rounded-lg font-medium transition ${
                   flowMode === 'bulk'
                     ? 'bg-blue-600 text-white'
                     : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
@@ -1073,41 +1274,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
             {/* Bulk Mode Section */}
             {flowMode === 'bulk' && (
               <>
-                {/* Bulk Method Selector */}
-                <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
-                  <label className="block text-sm font-medium text-slate-700 mb-3">
-                    Bulk Generation Method
-                  </label>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      onClick={() => setBulkMethod('prompt')}
-                      className={`py-2.5 px-3 rounded-lg font-medium text-xs transition-all ${
-                        bulkMethod === 'prompt'
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                      }`}
-                    >
-                      🎨 AI Prompt
-                    </button>
-                    <button
-                      onClick={() => setBulkMethod('csv')}
-                      className={`py-2.5 px-3 rounded-lg font-medium text-xs transition-all ${
-                        bulkMethod === 'csv'
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                      }`}
-                    >
-                      📊 CSV Upload
-                    </button>
-                  </div>
-                  <p className="mt-3 text-xs text-slate-500">
-                    {bulkMethod === 'prompt'
-                      ? 'AI generates template designs from your prompt'
-                      : 'Upload CSV file with user data, no API calls needed'}
-                  </p>
-                </div>
-
-                {/* Info Banner */}
+                {/* Info Banner - CSV Bulk Generation */}
                 <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
                   <div className="flex items-start">
                     <div className="flex-shrink-0">
@@ -1116,28 +1283,21 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                       </svg>
                     </div>
                     <div className="ml-3">
-                      <h3 className="text-sm font-medium text-blue-800">Bulk Generation Flow</h3>
-                      {bulkMethod === 'prompt' ? (
-                        <p className="mt-1 text-sm text-blue-700">
-                          <strong>Step 1:</strong> Enter your prompt and generate template designs.<br />
-                          <strong>Step 2:</strong> Select your favorite template.<br />
-                          <strong>Step 3:</strong> Add user IDs to generate personalized posters with real data.
-                        </p>
-                      ) : (
-                        <p className="mt-1 text-sm text-blue-700">
-                          <strong>Step 1:</strong> Upload CSV file with your data (must include "username" column).<br />
-                          <strong>Step 2:</strong> Create HTML template using CSV column names as placeholders.<br />
-                          <strong>Step 3:</strong> Preview, name your campaign, and generate posters for all rows.
-                        </p>
-                      )}
+                      <h3 className="text-sm font-medium text-blue-800">📊 CSV Bulk Generation Flow</h3>
+                      <p className="mt-1 text-sm text-blue-700">
+                        <strong>Step 1:</strong> Upload CSV file with your data (must include "username" column).<br />
+                        <strong>Step 2:</strong> Create HTML template using CSV column names as placeholders.<br />
+                        <strong>Step 3:</strong> Preview, name your campaign, and generate posters for all rows.
+                      </p>
                     </div>
                   </div>
                 </div>
               </>
             )}
 
+
             {/* Reference Image - Hide in bulk CSV mode */}
-            {!(flowMode === 'bulk' && bulkMethod === 'csv') && (
+            {flowMode !== 'bulk' && flowMode !== 'template' && (
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
               <div className="flex items-center justify-between mb-2">
                 <label className="block text-sm font-medium text-slate-700">
@@ -1199,24 +1359,30 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                   {/* Template Gallery */}
                   {showTemplates && (
                     <div className="grid grid-cols-4 gap-2 max-h-64 overflow-y-auto p-1">
-                      {TEMPLATE_IMAGES.map((template) => (
-                        <button
-                          key={template.id}
-                          onClick={() => handleSelectTemplate(template.url)}
-                          className="aspect-square rounded-lg overflow-hidden border-2 border-transparent hover:border-indigo-500 transition-all hover:scale-105 bg-slate-100"
-                        >
-                          <img
-                            src={template.url}
-                            alt={template.name}
-                            loading="lazy"
-                            className="w-full h-full object-cover"
-                            onError={(e) => {
-                              const target = e.target as HTMLImageElement;
-                              target.style.display = 'none';
-                            }}
-                          />
-                        </button>
-                      ))}
+                      {isLoadingTemplates ? (
+                        <div className="col-span-4 text-center py-8 text-slate-500">
+                          Loading templates...
+                        </div>
+                      ) : (
+                        allTemplates.map((template) => (
+                          <button
+                            key={template.id}
+                            onClick={() => handleSelectTemplate(template.url)}
+                            className="aspect-square rounded-lg overflow-hidden border-2 border-transparent hover:border-indigo-500 transition-all hover:scale-105 bg-slate-100"
+                          >
+                            <img
+                              src={template.url}
+                              alt={template.name}
+                              loading="lazy"
+                              className="w-full h-full object-cover"
+                              onError={(e) => {
+                                const target = e.target as HTMLImageElement;
+                                target.style.display = 'none';
+                              }}
+                            />
+                          </button>
+                        ))
+                      )}
                     </div>
                   )}
                 </div>
@@ -1224,8 +1390,8 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
             </div>
             )}
 
-            {/* Prompt - Show for single mode or bulk prompt mode */}
-            {(flowMode === 'single' || (flowMode === 'bulk' && bulkMethod === 'prompt')) && (
+            {/* Prompt - Show for single mode only */}
+            {flowMode === 'single' && (
               <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
                 <label className="block text-sm font-medium text-slate-700 mb-2">
                   What poster do you want?
@@ -1443,7 +1609,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
             )}
 
             {/* CSV Upload Mode - Show for bulk CSV mode */}
-            {flowMode === 'bulk' && bulkMethod === 'csv' && (
+            {flowMode === 'bulk' && (
               <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
                 <label className="block text-sm font-medium text-slate-700 mb-2">
                   Step 1: Upload CSV File
@@ -1475,6 +1641,8 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                     className="hidden"
                   />
                 </label>
+
+                {/* user_id is now optional - will be fetched from Topmate API during generation */}
 
                 {csvFile && csvData.length > 0 && (
                   <>
@@ -1671,7 +1839,13 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                                     // Check if response has jobId (RedPanda queue mode)
                                     if (data.success && data.jobId) {
                                       console.log('🔗 [CSV] Connecting to SSE for job:', data.jobId);
+                                      console.log('✅ [CSV] Setting csvJobId state:', data.jobId);
                                       setCsvJobId(data.jobId);
+
+                                      // BACKUP: Store in localStorage to prevent loss
+                                      localStorage.setItem('lastCsvJobId', data.jobId);
+                                      console.log('💾 [CSV] Saved jobId to localStorage:', data.jobId);
+
                                       setCsvLogs(prev => [...prev, `📋 Job created: ${data.jobId}`, '📡 Connecting to SSE for real-time updates...']);
                                       
                                       // Connect to SSE for real-time progress
@@ -1785,37 +1959,125 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                                   {/* Save to Database */}
                                   <button
                                     onClick={async () => {
+                                      console.log('🚨🚨🚨 [SAVE BUTTON v3] NEW CODE ACTIVE - WITH SSE WAIT 🚨🚨🚨');
                                       setIsSharing(true);
+                                      setCsvSaveProgress(null); // Reset progress
                                       try {
-                                        const successfulResults = csvGeneratedResults.filter(r => r.success);
+                                        // Get jobId from state or localStorage fallback
+                                        const jobIdToUse = csvJobId || localStorage.getItem('lastCsvJobId');
+                                        console.log(`📥 [PosterCreator v3] csvJobId state: ${csvJobId}`);
+                                        console.log(`📥 [PosterCreator v3] localStorage backup: ${localStorage.getItem('lastCsvJobId')}`);
+                                        console.log(`📥 [PosterCreator v3] Using jobId: ${jobIdToUse}`);
+
+                                        if (!jobIdToUse) {
+                                          alert('❌ Error: Job ID not found. Please generate posters first.');
+                                          setIsSharing(false);
+                                          return;
+                                        }
+
+                                        // FIXED: Fetch posters from backend WITH userId from database metadata
+                                        console.log(`📥 [PosterCreator v2] Fetching posters with userId for job: ${jobIdToUse}`);
+
+                                        const postersResponse = await apiFetch(`/api/batch/jobs/${jobIdToUse}/posters-for-save`);
+                                        const postersData = await postersResponse.json();
+
+                                        if (!postersData.success) {
+                                          throw new Error(postersData.error || 'Failed to fetch posters');
+                                        }
+
+                                        const postersToSave = postersData.posters;
+                                        console.log(`✅ [PosterCreator v2] Fetched ${postersToSave.length} posters with userId:`, postersToSave);
+
+                                        if (postersToSave.length === 0) {
+                                          alert('No posters available to save');
+                                          setIsSharing(false);
+                                          return;
+                                        }
+
+                                        // Check for missing user_id
+                                        if (postersData.totalMissingUserId > 0) {
+                                          const proceed = confirm(
+                                            `⚠️ Warning: ${postersData.totalMissingUserId} posters are missing user_id.\n\n` +
+                                            `${postersData.warning}\n\n` +
+                                            `Proceed with ${postersData.totalPosters} posters that have user_id?`
+                                          );
+                                          if (!proceed) {
+                                            setIsSharing(false);
+                                            return;
+                                          }
+                                        }
 
                                         const response = await apiFetch('/api/save-bulk-posters', {
                                           method: 'POST',
                                           headers: { 'Content-Type': 'application/json' },
                                           body: JSON.stringify({
-                                            posters: successfulResults.map((r: any) => ({
-                                              username: r.username,
-                                              posterUrl: r.posterUrl,
-                                            })),
+                                            posters: postersToSave,
                                             posterName: csvCampaignName.trim(),
                                           }),
                                         });
 
                                         const data = await response.json();
 
-                                        if (!response.ok) {
+                                        if (!response.ok || !data.success || !data.jobId) {
                                           throw new Error(data.error || 'Save failed');
                                         }
 
-                                        // Show success message with configuration
-                                        setCsvSaveSuccess(true);
-                                        setCsvSavedConfig({
-                                          campaign: csvCampaignName.trim(),
-                                          content_type: "image"
+                                        const saveJobId = data.jobId;
+                                        console.log(`✅ [PosterCreator v3] Save job started: ${saveJobId}`);
+                                        console.log(`🔌 [PosterCreator v3] Connecting to SSE: ${data.sseEndpoint}`);
+
+                                        // Connect to SSE for real-time save progress
+                                        const sseUrl = `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}${data.sseEndpoint}`;
+                                        const eventSource = new EventSource(sseUrl);
+
+                                        eventSource.onopen = () => {
+                                          console.log('✅ [PosterCreator v3] SSE CONNECTED - Waiting for events...');
+                                        };
+
+                                        eventSource.addEventListener('progress', (event) => {
+                                          const progressData = JSON.parse(event.data);
+                                          console.log(`💾 [PosterCreator v3] PROGRESS EVENT: ${progressData.processed}/${progressData.total} (${progressData.success} success, ${progressData.failed} failed)`);
+                                          setCsvSaveProgress({
+                                            processed: progressData.processed,
+                                            total: progressData.total,
+                                            success: progressData.success,
+                                            failed: progressData.failed
+                                          });
                                         });
+
+                                        eventSource.addEventListener('complete', (event) => {
+                                          console.log('🎉 [PosterCreator v3] COMPLETE EVENT RECEIVED!');
+                                          const completeData = JSON.parse(event.data);
+                                          const { success, failed, total } = completeData;
+
+                                          eventSource.close();
+                                          console.log(`✅ [PosterCreator v3] Save Complete: ${success}/${total} saved successfully, ${failed} failed`);
+
+                                          // Only show success if at least some succeeded
+                                          if (success > 0) {
+                                            console.log('✅ [PosterCreator v3] Setting csvSaveSuccess = TRUE (success > 0)');
+                                            setCsvSaveSuccess(true);
+                                            setCsvSavedConfig({
+                                              campaign: csvCampaignName.trim(),
+                                              content_type: "image"
+                                            });
+                                          } else {
+                                            console.log('❌ [PosterCreator v3] NOT setting success - all failed!');
+                                            alert(`❌ Save Failed!\n\n0 out of ${total} posters were saved successfully.\nAll ${failed} posters failed.\n\nCheck backend logs for details.`);
+                                          }
+
+                                          setIsSharing(false);
+                                        });
+
+                                        eventSource.onerror = (error) => {
+                                          console.error('❌ SSE error during save:', error);
+                                          eventSource.close();
+                                          alert('❌ Connection lost during save. Please check if posters were saved.');
+                                          setIsSharing(false);
+                                        };
+
                                       } catch (err) {
                                         alert(`❌ Error: ${err instanceof Error ? err.message : 'Save failed'}`);
-                                      } finally {
                                         setIsSharing(false);
                                       }
                                     }}
@@ -1828,7 +2090,11 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                                           <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
                                           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                                         </svg>
-                                        Saving...
+                                        {csvSaveProgress ? (
+                                          `Saving ${csvSaveProgress.processed}/${csvSaveProgress.total} (${csvSaveProgress.success} ✓, ${csvSaveProgress.failed} ✗)`
+                                        ) : (
+                                          'Saving...'
+                                        )}
                                       </>
                                     ) : (
                                       <>
@@ -2274,7 +2540,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
             )}
 
             {/* Mode Toggle - Hide in CSV template mode and Expert mode */}
-            {!(flowMode === 'bulk' && bulkMethod === 'csv') && userMode === 'admin' && (
+            {flowMode !== 'bulk' && userMode === 'admin' && (
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
               <label className="block text-sm font-medium text-slate-700 mb-3">
                 Output Type
@@ -2325,7 +2591,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
             )}
 
             {/* Model Selection - Hide in CSV template mode and Expert mode */}
-            {!(flowMode === 'bulk' && bulkMethod === 'csv') && userMode === 'admin' && (
+            {flowMode !== 'bulk' && userMode === 'admin' && (
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
               <label className="block text-sm font-medium text-slate-700 mb-3">
                 AI Model
@@ -2362,7 +2628,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
             )}
 
             {/* Generation Mode Toggle - Hide in CSV template mode and Expert mode */}
-            {!(flowMode === 'bulk' && bulkMethod === 'csv') && userMode === 'admin' && (
+            {flowMode !== 'bulk' && userMode === 'admin' && (
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
               <label className="block text-sm font-medium text-slate-700 mb-3">
                 Generation Method
@@ -2404,14 +2670,13 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
             )}
 
             {/* Generate Button - Hide in CSV template mode (has its own flow) */}
-            {!(flowMode === 'bulk' && bulkMethod === 'csv') && (
+            {flowMode !== 'bulk' && (
             <>
             <button
               onClick={handleGenerate}
               disabled={
                 isLoading ||
-                (flowMode === 'single' && (!topmateUsername.trim() || !prompt.trim())) ||
-                (flowMode === 'bulk' && bulkMethod === 'prompt' && !prompt.trim())
+                (flowMode === 'single' && (!topmateUsername.trim() || !prompt.trim()))
               }
               className="w-full py-4 px-6 bg-gradient-to-r from-purple-600 to-pink-600 text-white font-semibold rounded-xl hover:from-purple-700 hover:to-pink-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg"
             >
@@ -2539,41 +2804,17 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                     </button>
                   )}
 
+                  {/* Edit in New Page - Production Edit Mode */}
                   {/* Edit Poster */}
-                  {!isEditMode ? (
-                    <button
-                      onClick={handleEnableEditMode}
-                      className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-1.5"
-                    >
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                      </svg>
-                      Edit Poster
-                    </button>
-                  ) : (
-                    <>
-                      {!showEditPanel && (
-                        <button
-                          onClick={() => setShowEditPanel(true)}
-                          className="px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-1.5"
-                        >
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                          </svg>
-                          Show Edit Panel
-                        </button>
-                      )}
-                      <button
-                        onClick={handleDisableEditMode}
-                        className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-1.5"
-                      >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                        Exit Edit
-                      </button>
-                    </>
-                  )}
+                  <button
+                    onClick={handleOpenEditPage}
+                    className="px-3 py-1.5 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white text-sm font-medium rounded-lg transition-all shadow-md hover:shadow-lg flex items-center gap-1.5"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                    </svg>
+                    Edit Poster
+                  </button>
 
                   {/* Share to Topmate */}
                   <button
@@ -2996,6 +3237,145 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
           model={selectedModel}
           onClose={() => setShowTopmateShare(false)}
         />
+      )}
+
+      {/* Admin Upload Modal */}
+      {showAdminUpload && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full max-h-[90vh] overflow-y-auto shadow-2xl">
+            <div className="p-6 border-b border-slate-200 flex items-center justify-between">
+              <h2 className="text-xl font-bold text-slate-900">Admin Upload</h2>
+              <button
+                onClick={() => setShowAdminUpload(false)}
+                className="p-2 hover:bg-slate-100 rounded-lg transition-colors"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="p-6 space-y-6">
+              {/* Upload Template Image */}
+              <div className="border-2 border-dashed border-slate-300 rounded-xl p-6 hover:border-purple-500 transition-colors">
+                <h3 className="font-semibold text-slate-900 mb-4 flex items-center gap-2">
+                  <svg className="w-5 h-5 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                  </svg>
+                  Upload Template Image
+                </h3>
+                
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1">Template Name</label>
+                    <input
+                      type="text"
+                      value={newTemplateName}
+                      onChange={(e) => setNewTemplateName(e.target.value)}
+                      placeholder="e.g., Modern Gradient"
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1">Category</label>
+                    <select
+                      value={newTemplateCategory}
+                      onChange={(e) => setNewTemplateCategory(e.target.value as any)}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500"
+                    >
+                      <option value="minimal">Minimal</option>
+                      <option value="bold">Bold</option>
+                      <option value="gradient">Gradient</option>
+                      <option value="photo">Photo</option>
+                    </select>
+                  </div>
+
+                  <label className="block">
+                    <div className="w-full px-4 py-3 bg-purple-50 border-2 border-purple-200 rounded-lg cursor-pointer hover:bg-purple-100 transition-colors text-center">
+                      <svg className="w-6 h-6 mx-auto mb-2 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                      </svg>
+                      <span className="text-sm font-medium text-purple-700">
+                        {uploadingTemplate ? 'Uploading...' : 'Choose Image File'}
+                      </span>
+                    </div>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) handleUploadTemplate(file);
+                      }}
+                      disabled={uploadingTemplate}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
+              </div>
+
+              {/* Upload Custom Font */}
+              <div className="border-2 border-dashed border-slate-300 rounded-xl p-6 hover:border-emerald-500 transition-colors">
+                <h3 className="font-semibold text-slate-900 mb-4 flex items-center gap-2">
+                  <svg className="w-5 h-5 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                  </svg>
+                  Upload Custom Font
+                </h3>
+                
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1">Font Name</label>
+                    <input
+                      type="text"
+                      value={newFontName}
+                      onChange={(e) => setNewFontName(e.target.value)}
+                      placeholder="e.g., Montserrat Bold"
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-emerald-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1">
+                      Font Family <span className="text-red-500">*</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={newFontFamily}
+                      onChange={(e) => setNewFontFamily(e.target.value)}
+                      placeholder="e.g., Montserrat"
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-emerald-500"
+                      required
+                    />
+                    <p className="text-xs text-slate-500 mt-1">This will appear in the font dropdown</p>
+                  </div>
+
+                  <label className="block">
+                    <div className="w-full px-4 py-3 bg-emerald-50 border-2 border-emerald-200 rounded-lg cursor-pointer hover:bg-emerald-100 transition-colors text-center">
+                      <svg className="w-6 h-6 mx-auto mb-2 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                      </svg>
+                      <span className="text-sm font-medium text-emerald-700">
+                        {uploadingFont ? 'Uploading...' : 'Choose Font File'}
+                      </span>
+                      <p className="text-xs text-emerald-600 mt-1">ttf, woff, woff2, otf</p>
+                    </div>
+                    <input
+                      type="file"
+                      accept=".ttf,.woff,.woff2,.otf"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) handleUploadFont(file);
+                      }}
+                      disabled={uploadingFont}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

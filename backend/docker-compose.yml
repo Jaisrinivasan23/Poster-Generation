@@ -75,6 +75,21 @@ services:
       timeout: 5s
       retries: 5
 
+  # Redis for TaskIQ
+  redis:
+    image: redis:7-alpine
+    container_name: poster-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: redis-server --appendonly yes
+
   # FastAPI Backend
   backend:
     build: .
@@ -100,6 +115,10 @@ services:
       - POSTGRES_DB=poster_generation
       - POSTGRES_USER=poster_user
       - POSTGRES_PASSWORD=2005
+      # Redis Configuration (for TaskIQ)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
     volumes:
       - ./app:/app/app:ro
       - ./.env:/app/.env:ro
@@ -109,6 +128,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -116,9 +137,46 @@ services:
       timeout: 10s
       retries: 3
 
+  # TaskIQ Workers (4 parallel workers)
+  taskiq-worker:
+    build: .
+    container_name: poster-taskiq-worker
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - DJANGO_API_URL=${DJANGO_API_URL}
+      - AWS_S3_BUCKET=${AWS_S3_BUCKET}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - S3_BASE_URL=${S3_BASE_URL}
+      - REDPANDA_BROKER=redpanda:9092
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=poster_generation
+      - POSTGRES_USER=poster_user
+      - POSTGRES_PASSWORD=2005
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+    volumes:
+      - ./app:/app/app:ro
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: taskiq worker app.tasks.poster_tasks:broker --fs-discover --workers 4
+    deploy:
+      replicas: 1
+
 volumes:
   redpanda-data:
   postgres-data:
+  redis-data:
 
 networks:
   default:

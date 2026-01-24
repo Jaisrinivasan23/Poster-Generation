@@ -39,10 +39,17 @@ class Settings(BaseSettings):
     postgres_db: str = "poster_generation"
     postgres_user: str = "poster_user"
     postgres_password: str = "poster_secure_pwd_2024"
-    
+
+    # Redis Configuration (for TaskIQ)
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_db: int = 0
+    redis_password: Optional[str] = None
+
     # Batch Processing Configuration
-    batch_size: int = 8
+    batch_size: int = 10  # Increased to 10 parallel jobs
     max_concurrent_jobs: int = 5
+    taskiq_workers: int = 4  # Number of TaskIQ worker processes
 
     class Config:
         env_file = ".env"

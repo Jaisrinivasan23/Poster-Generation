@@ -111,8 +111,8 @@ interface GenerationResult {
 type ActiveTab = 'preview' | 'html' | 'variables' | 'images' | 'chat';
 
 export default function Home() {
-  // Creation mode state
-  const [creationMode, setCreationMode] = useState<CreationMode | null>(null);
+  // Creation mode state - Default to 'poster' mode
+  const [creationMode, setCreationMode] = useState<CreationMode | null>('poster');
 
   // Form state - colors are optional, AI will decide if not provided
   const [formData, setFormData] = useState({

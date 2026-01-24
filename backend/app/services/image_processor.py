@@ -10,51 +10,40 @@ from typing import Optional, Dict
 
 
 async def overlay_logo_and_profile(
-    base_image_url: str,
-    logo_url: Optional[str],
-    profile_pic_url: Optional[str],
-    dimensions: Dict[str, int]
-) -> str:
+    base_image_bytes: bytes,
+    topmate_logo: Optional[str],
+    profile_image: Optional[str]
+) -> bytes:
     """
     Overlay logo and profile picture on base image
 
     Args:
-        base_image_url: Base image as data URL or HTTP URL
-        logo_url: Topmate logo as data URL (optional)
-        profile_pic_url: Profile picture URL (optional)
-        dimensions: Image dimensions {width, height}
+        base_image_bytes: Base image as bytes
+        topmate_logo: Topmate logo as data URL (optional)
+        profile_image: Profile picture as data URL (optional)
 
     Returns:
-        Composited image as data URL
+        Composited image as bytes
     """
     print("[OVERLAY] Starting image composition")
 
-    # Load base image
-    if base_image_url.startswith("data:image/"):
-        # Parse data URL
-        base64_data = base_image_url.split(",", 1)[1]
-        image_data = base64.b64decode(base64_data)
-        base_image = Image.open(io.BytesIO(image_data))
-    else:
-        # Fetch from URL
-        async with httpx.AsyncClient() as client:
-            response = await client.get(base_image_url)
-            base_image = Image.open(io.BytesIO(response.content))
+    # Load base image from bytes
+    base_image = Image.open(io.BytesIO(base_image_bytes))
 
-    # Resize to target dimensions
-    base_image = base_image.resize((dimensions["width"], dimensions["height"]), Image.Resampling.LANCZOS)
+    # Convert to RGBA
     base_image = base_image.convert("RGBA")
+    dimensions = {"width": base_image.width, "height": base_image.height}
 
     # Add logo overlay (top-right corner)
-    if logo_url:
+    if topmate_logo:
         print("[OVERLAY] Adding Topmate logo")
         try:
-            if logo_url.startswith("data:"):
-                logo_data = base64.b64decode(logo_url.split(",", 1)[1])
+            if topmate_logo.startswith("data:"):
+                logo_data = base64.b64decode(topmate_logo.split(",", 1)[1])
                 logo_image = Image.open(io.BytesIO(logo_data))
             else:
                 async with httpx.AsyncClient() as client:
-                    response = await client.get(logo_url)
+                    response = await client.get(topmate_logo)
                     logo_image = Image.open(io.BytesIO(response.content))
 
             # Resize logo to 70px width (maintain aspect ratio)
@@ -73,18 +62,23 @@ async def overlay_logo_and_profile(
             print(f"[OVERLAY] Failed to add logo: {e}")
 
     # Add profile picture overlay (bottom-left corner, circular)
-    if profile_pic_url:
+    if profile_image:
         print("[OVERLAY] Adding profile picture")
         try:
-            # Fetch profile picture
-            async with httpx.AsyncClient() as client:
-                response = await client.get(profile_pic_url)
-                profile_image = Image.open(io.BytesIO(response.content))
+            # Parse profile picture from data URL
+            if profile_image.startswith("data:"):
+                profile_data = base64.b64decode(profile_image.split(",", 1)[1])
+                profile_img = Image.open(io.BytesIO(profile_data))
+            else:
+                # Fetch from URL
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(profile_image)
+                    profile_img = Image.open(io.BytesIO(response.content))
 
             # Create circular mask
             size = 100  # Profile picture diameter
-            profile_image = profile_image.resize((size, size), Image.Resampling.LANCZOS)
-            profile_image = profile_image.convert("RGBA")
+            profile_img = profile_img.resize((size, size), Image.Resampling.LANCZOS)
+            profile_img = profile_img.convert("RGBA")
 
             # Create circular mask
             mask = Image.new("L", (size, size), 0)
@@ -93,7 +87,7 @@ async def overlay_logo_and_profile(
 
             # Apply mask
             circular_profile = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-            circular_profile.paste(profile_image, (0, 0))
+            circular_profile.paste(profile_img, (0, 0))
             circular_profile.putalpha(mask)
 
             # Add white border (3px)
@@ -115,18 +109,16 @@ async def overlay_logo_and_profile(
         except Exception as e:
             print(f"[OVERLAY] Failed to add profile picture: {e}")
 
-    # Convert to PNG data URL
+    # Convert to PNG bytes
     buffer = io.BytesIO()
     base_image.convert("RGB").save(buffer, format="PNG")
     buffer.seek(0)
-    image_base64 = base64.b64encode(buffer.getvalue()).decode()
-    data_url = f"data:image/png;base64,{image_base64}"
 
     print("[OVERLAY] Image composition complete")
-    return data_url
+    return buffer.getvalue()
 
 
-def replace_placeholders(html: str, data: Dict[str, any], columns: list[str]) -> str:
+def replace_placeholders(html: str, data: Dict[str, any], columns: Optional[list[str]] = None) -> str:
     """
     Replace placeholders in HTML with actual data
     Also handles showing/hiding elements based on placeholder values
@@ -134,7 +126,7 @@ def replace_placeholders(html: str, data: Dict[str, any], columns: list[str]) ->
     Args:
         html: HTML template with placeholders like {column_name}
         data: Data dictionary
-        columns: List of column names
+        columns: List of column names (if None, uses all keys from data dict)
 
     Returns:
         HTML with placeholders replaced
@@ -142,6 +134,10 @@ def replace_placeholders(html: str, data: Dict[str, any], columns: list[str]) ->
     import re
 
     result = html
+
+    # If columns not provided, use all keys from data dict
+    if columns is None:
+        columns = list(data.keys())
 
     # Replace each placeholder
     for col in columns:

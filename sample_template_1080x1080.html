@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            width: 1080px;
+            height: 1080px;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: {{overlay_fill_color}};
+            padding: 60px;
+            overflow: hidden;
+        }
+        .card {
+            max-width: 800px;
+            width: 100%;
+            background: white;
+            border-radius: 24px;
+            padding: 60px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.2);
+        }
+        .quote-icon {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        .quote-icon svg {
+            width: 60px;
+            height: 60px;
+        }
+        .message {
+            font-size: 28px;
+            line-height: 1.6;
+            color: #1a1a1a;
+            margin: 0 0 40px 0;
+            font-weight: 400;
+            text-align: center;
+        }
+        .author-section {
+            text-align: center;
+            border-top: 2px solid {{overlay_fill_color}};
+            padding-top: 30px;
+        }
+        .author-name {
+            font-size: 24px;
+            font-weight: 700;
+            color: #1a1a1a;
+            margin: 0 0 8px 0;
+        }
+        .testimonial-info {
+            font-size: 18px;
+            color: #666;
+            margin: 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="quote-icon">
+            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M7.5 12C7.5 10.343 6.157 9 4.5 9c-1.657 0-3 1.343-3 3s1.343 3 3 3c.386 0 .755-.074 1.094-.209L7.5 16.5v-4.5z" fill="{{overlay_fill_color}}" opacity="0.3"/>
+                <path d="M19.5 12c0-1.657-1.343-3-3-3s-3 1.343-3 3 1.343 3 3 3c.386 0 .755-.074 1.094-.209L19.5 16.5V12z" fill="{{overlay_fill_color}}" opacity="0.3"/>
+            </svg>
+        </div>
+        
+        <p class="message">"{{consumer_message}}"</p>
+        
+        <div class="author-section">
+            <p class="author-name">{{consumer_name}}</p>
+            <p class="testimonial-info">Testimonial #{{testimonial_id}}</p>
+        </div>
+    </div>
+</body>
+</html>

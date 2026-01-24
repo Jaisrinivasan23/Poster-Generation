@@ -44,3 +44,8 @@ psycopg2-binary==2.9.9
 # Logging
 structlog==24.1.0
 python-json-logger==2.0.7
+
+# TaskIQ for async task processing
+taskiq==0.11.3
+taskiq-redis==1.0.0
+redis==5.0.1

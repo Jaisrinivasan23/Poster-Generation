@@ -1,6 +1,6 @@
 """
 Job Manager Service
-Orchestrates batch poster generation jobs with RedPanda and PostgreSQL
+Orchestrates batch poster generation jobs with TaskIQ, RedPanda and PostgreSQL
 """
 import asyncio
 import uuid
@@ -78,21 +78,23 @@ class JobManager:
     async def _handle_job_message(self, message: Dict[str, Any]):
         """Handle incoming job message from RedPanda"""
         job_id = message.get("job_id")
-        job_type = message.get("job_type", "html")  # Default to HTML job type
+        job_type = message.get("type") or message.get("job_type", "html")  # Support both 'type' and 'job_type'
         print(f"🔴 [REDPANDA] Received job message: {job_id} (type: {job_type})")
         if not job_id:
             logger.error("Received message without job_id")
             return
-        
+
         logger.info("Processing job from queue", job_id=job_id, job_type=job_type)
-        
+
         # Start processing in background based on job type
         if job_type == "csv":
             task = asyncio.create_task(self._process_csv_job(message))
+        elif job_type == "template_poster":
+            task = asyncio.create_task(self._process_template_poster(message))
         else:
             task = asyncio.create_task(self._process_job(message))
         self._active_jobs[job_id] = task
-        
+
         try:
             await task
         finally:
@@ -111,25 +113,28 @@ class JobManager:
     ) -> Dict[str, Any]:
         """
         Create a new batch job and queue it for processing
-        
+
         Returns job details immediately for SSE tracking
         """
+        import time as time_module
+        start_time = time_module.time()
         job_id = f"job_{uuid.uuid4().hex[:12]}"
-        
-        print(f"🚀 [JOB] Creating job {job_id} with campaign: {campaign_name}")
+
+        print(f"🚀 [JOB {job_id}] Creating job with campaign: {campaign_name} (t=0.000s)")
         
         # Parse identifiers
         usernames, user_ids = parse_user_identifiers(user_identifiers)
         total_items = len(usernames) + len(user_ids)
-        
-        print(f"📋 [JOB] Parsed {len(usernames)} usernames, {len(user_ids)} user IDs (total: {total_items})")
-        
+
+        elapsed = time_module.time() - start_time
+        print(f"📋 [JOB {job_id}] Parsed {len(usernames)} usernames, {len(user_ids)} user IDs (total: {total_items}) (t={elapsed:.3f}s)")
+
         if total_items == 0:
             raise ValueError("No valid user identifiers provided")
-        
+
         # Get dimensions
         dimensions = POSTER_SIZE_DIMENSIONS.get(poster_size, POSTER_SIZE_DIMENSIONS["instagram-square"])
-        
+
         # Create job in database
         await database_service.create_batch_job(
             job_id=job_id,
@@ -146,7 +151,10 @@ class JobManager:
                 **(metadata or {})
             }
         )
-        
+
+        elapsed = time_module.time() - start_time
+        print(f"💾 [JOB {job_id}] Database job created (t={elapsed:.3f}s)")
+
         # Log job creation
         await database_service.add_log(
             job_id=job_id,
@@ -155,8 +163,10 @@ class JobManager:
             details={"campaign_name": campaign_name, "poster_size": poster_size}
         )
         
-        # Publish to RedPanda queue
+        # Queue to TaskIQ for async processing
         job_data = {
+            "job_id": job_id,
+            "job_type": "html",
             "campaign_name": campaign_name,
             "usernames": usernames,
             "user_ids": user_ids,
@@ -168,60 +178,70 @@ class JobManager:
             "skip_overlays": skip_overlays,
             "metadata": metadata or {}
         }
-        
-        published = await redpanda_client.publish_job(job_id, job_data)
-        
-        print(f"🔴 [REDPANDA] Published to queue: {published}")
-        
-        if published:
-            print(f"✅ [JOB] Job {job_id} queued for RedPanda processing")
-            await database_service.update_job_status(job_id, "queued")
-            await database_service.add_log(
-                job_id=job_id,
-                level="INFO",
-                message="Job queued for processing"
-            )
-        else:
-            # If RedPanda is not available, process synchronously
-            print(f"⚠️ [JOB] RedPanda not available, processing {job_id} synchronously")
-            logger.warning("RedPanda not available, processing synchronously", job_id=job_id)
-            asyncio.create_task(self._process_job({"job_id": job_id, **job_data}))
-        
+
+        # Import here to avoid circular import
+        from app.tasks.poster_tasks import process_batch_job_task
+
+        # Queue task to TaskIQ
+        task = await process_batch_job_task.kiq(
+            job_id=job_id,
+            job_type="html",
+            job_data=job_data
+        )
+
+        elapsed = time_module.time() - start_time
+        print(f"🔵 [JOB {job_id}] TaskIQ job queued (task_id: {task.task_id}) (t={elapsed:.3f}s)")
+
+        await database_service.update_job_status(job_id, "queued")
+        await database_service.add_log(
+            job_id=job_id,
+            level="INFO",
+            message=f"HTML job queued for TaskIQ processing (task_id: {task.task_id})"
+        )
+
+        elapsed = time_module.time() - start_time
+        print(f"✅ [JOB {job_id}] Job creation complete, ready for processing (t={elapsed:.3f}s)")
+
         return {
             "job_id": job_id,
+            "task_id": str(task.task_id),
             "status": "queued",
             "total_items": total_items,
             "campaign_name": campaign_name,
             "created_at": datetime.utcnow().isoformat()
         }
     
-    async def _process_job(self, job_data: Dict[str, Any]):
+    async def _process_html_job_with_redpanda(self, job_data: Dict[str, Any]):
         """Process a batch job"""
         job_id = job_data["job_id"]
         start_time = time.time()
-        
+
         print(f"")
         print(f"{'='*60}")
+        print(f"⚡ [WORKER {job_id}] TaskIQ worker picked up job (t=0.000s)")
         print(f"🔄 [PROCESS] Starting job processing: {job_id}")
         print(f"{'='*60}")
         
         try:
             await database_service.update_job_status(job_id, "processing")
-            await sse_manager.send_log(job_id, "INFO", "Job processing started")
-            
+
             usernames = job_data.get("usernames", [])
             user_ids = job_data.get("user_ids", [])
             html_template = job_data.get("html_template", "")
             dimensions = job_data.get("dimensions", {"width": 1080, "height": 1080})
             topmate_logo = job_data.get("topmate_logo")
             skip_overlays = job_data.get("skip_overlays", False)
-            
+
             total_items = len(usernames) + len(user_ids)
             print(f"📋 [PROCESS] Job {job_id}: {total_items} items to process")
             processed = 0
             success_count = 0
             failure_count = 0
             results = []
+
+            # Send initial progress immediately (0/total) so frontend shows it started
+            await sse_manager.send_progress(job_id, 0, total_items, 0, 0, None, "starting")
+            await sse_manager.send_log(job_id, "INFO", f"Job processing started - {total_items} posters to generate")
             
             # Fetch all profiles first
             profiles = []
@@ -265,10 +285,10 @@ class JobManager:
             await sse_manager.send_log(job_id, "INFO", f"Fetched {len(profiles)} profiles, generating posters...")
             print(f"✅ [PROCESS] Fetched {len(profiles)} profiles successfully")
             
-            # Process posters in batches of 8
-            BATCH_SIZE = 8
+            # Process posters in batches of 10 (parallel processing)
+            BATCH_SIZE = settings.batch_size  # 10 parallel jobs
             total_batches = (len(profiles) + BATCH_SIZE - 1) // BATCH_SIZE
-            print(f"📦 [PROCESS] Processing {len(profiles)} posters in {total_batches} batches")
+            print(f"📦 [PROCESS] Processing {len(profiles)} posters in {total_batches} batches (batch size: {BATCH_SIZE})")
             
             for i in range(0, len(profiles), BATCH_SIZE):
                 batch = profiles[i:i + BATCH_SIZE]
@@ -303,6 +323,29 @@ class JobManager:
                         failure_count += 1
                         error_msg = str(result)
                         print(f"❌ [POSTER] Failed: {identifier} - {error_msg[:50]}...")
+
+                        # Determine failure type
+                        failure_type = "unknown"
+                        if "Timeout" in error_msg:
+                            failure_type = "timeout"
+                        elif "HTML to PNG" in error_msg:
+                            failure_type = "html_conversion"
+                        elif "S3" in error_msg or "upload" in error_msg.lower():
+                            failure_type = "upload"
+                        elif "profile" in error_msg.lower():
+                            failure_type = "profile_fetch"
+
+                        # Log failure details
+                        await database_service.log_poster_failure(
+                            job_id=job_id,
+                            poster_id=None,
+                            user_identifier=identifier,
+                            username=identifier,
+                            failure_type=failure_type,
+                            error_message=error_msg,
+                            error_details={"profile": item.get("profile", {})}
+                        )
+
                         results.append({
                             "username": identifier,
                             "success": False,
@@ -314,17 +357,18 @@ class JobManager:
                         print(f"✅ [POSTER] Success: {identifier} ({processed}/{total_items})")
                         results.append(result)
                         await sse_manager.send_poster_completed(job_id, identifier, result.get("posterUrl", ""), True)
-                    
+
+                    # Send progress update for EACH poster
                     await sse_manager.send_progress(job_id, processed, total_items, success_count, failure_count, identifier)
-                
-                # Update database
-                await database_service.update_job_status(
-                    job_id=job_id,
-                    status="processing",
-                    processed_items=processed,
-                    success_count=success_count,
-                    failure_count=failure_count
-                )
+
+                    # Update database for EACH poster (so progress is real-time)
+                    await database_service.update_job_status(
+                        job_id=job_id,
+                        status="processing",
+                        processed_items=processed,
+                        success_count=success_count,
+                        failure_count=failure_count
+                    )
                 
                 # Brief delay between batches
                 await asyncio.sleep(0.5)
@@ -417,24 +461,29 @@ class JobManager:
         try:
             username = profile.get("username", identifier)
             
-            # Create poster record in database
+            # Create poster record in database with user_id in metadata
+            metadata = {}
+            if profile.get("user_id"):
+                metadata["user_id"] = profile.get("user_id")
+            
             poster_id = await database_service.create_poster_record(
                 job_id=job_id,
                 user_identifier=identifier,
                 username=username,
-                display_name=profile.get("display_name")
+                display_name=profile.get("display_name"),
+                metadata=metadata
             )
             
             # Replace placeholders in HTML
             personalized_html = replace_placeholders(html_template, profile)
             
-            # Convert HTML to PNG (returns data URL)
-            image_data_url = await convert_html_to_png(
+            # Convert HTML to PNG
+            image_bytes = await convert_html_to_png(
                 html=personalized_html,
                 dimensions=dimensions
             )
             
-            if not image_data_url:
+            if not image_bytes:
                 raise Exception("Failed to convert HTML to image")
             
             # Apply overlays if needed
@@ -446,17 +495,16 @@ class JobManager:
                     profile_image_data = None
                 
                 if topmate_logo or profile_image_data:
-                    image_data_url = await overlay_logo_and_profile(
-                        base_image_url=image_data_url,
-                        logo_url=topmate_logo,
-                        profile_pic_url=profile_image_data,
-                        dimensions=dimensions
+                    image_bytes = await overlay_logo_and_profile(
+                        base_image_bytes=image_bytes,
+                        topmate_logo=topmate_logo,
+                        profile_image=profile_image_data
                     )
             
-            # Upload to S3 (upload_image takes data_url, filename and returns URL string)
-            poster_url = await upload_image(
-                image_data_url,
-                f"{job_id}/{username}_{int(time.time())}.png"
+            # Upload to S3
+            s3_result = await upload_image(
+                image_bytes=image_bytes,
+                filename=f"{job_id}/{username}_{int(time.time())}.png"
             )
             
             processing_time_ms = int((time.time() - start_time) * 1000)
@@ -465,16 +513,16 @@ class JobManager:
             await database_service.update_poster_status(
                 poster_id=poster_id,
                 status="completed",
-                poster_url=poster_url,
-                s3_key=None,
+                poster_url=s3_result.get("url"),
+                s3_key=s3_result.get("key"),
                 processing_time_ms=processing_time_ms
             )
             
             return {
                 "username": username,
                 "success": True,
-                "posterUrl": poster_url,
-                "s3Key": None,
+                "posterUrl": s3_result.get("url"),
+                "s3Key": s3_result.get("key"),
                 "processingTimeMs": processing_time_ms
             }
             
@@ -586,8 +634,9 @@ class JobManager:
             details={"campaign_name": campaign_name, "poster_size": poster_size}
         )
         
-        # Publish to RedPanda queue
+        # Queue to TaskIQ for async processing
         job_data = {
+            "job_id": job_id,
             "job_type": "csv",
             "csv_data": csv_data,
             "csv_template": csv_template,
@@ -599,380 +648,154 @@ class JobManager:
             "skip_overlays": skip_overlays,
             "metadata": metadata or {}
         }
-        
-        published = await redpanda_client.publish_job(job_id, job_data)
-        
-        print(f"🔴 [REDPANDA] CSV job published to queue: {published}")
-        
-        if published:
-            print(f"✅ [JOB] CSV Job {job_id} queued for RedPanda processing")
-            await database_service.update_job_status(job_id, "queued")
-            await database_service.add_log(
-                job_id=job_id,
-                level="INFO",
-                message="CSV job queued for processing"
-            )
-        else:
-            print(f"⚠️ [JOB] RedPanda not available, processing CSV job {job_id} synchronously")
-            asyncio.create_task(self._process_csv_job({"job_id": job_id, **job_data}))
-        
+
+        # Import here to avoid circular import
+        from app.tasks.poster_tasks import process_batch_job_task
+
+        # Queue task to TaskIQ
+        task = await process_batch_job_task.kiq(
+            job_id=job_id,
+            job_type="csv",
+            job_data=job_data
+        )
+
+        print(f"🔵 [TASKIQ] CSV job queued: {job_id} (task_id: {task.task_id})")
+
+        await database_service.update_job_status(job_id, "queued")
+        await database_service.add_log(
+            job_id=job_id,
+            level="INFO",
+            message=f"CSV job queued for TaskIQ processing (task_id: {task.task_id})"
+        )
+
         return {
             "job_id": job_id,
+            "task_id": str(task.task_id),
             "status": "queued",
             "total_items": total_items,
             "campaign_name": campaign_name,
             "created_at": datetime.utcnow().isoformat()
         }
     
-    async def create_single_job(
-        self,
-        topmate_username: str,
-        prompt: str,
-        poster_size: str = "instagram-square",
-        model: str = "flash",
-        user_mode: str = "admin",
-        reference_image: Optional[str] = None,
-        topmate_logo: Optional[str] = None,
-        custom_dimensions: Optional[Dict[str, int]] = None,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """
-        Create a single AI poster generation job (3 variants) via RedPanda
-        """
-        job_id = f"job_{uuid.uuid4().hex[:12]}"
-        total_items = 3  # Always 3 variants
-        
-        print(f"🚀 [JOB] Creating single AI job {job_id} for {topmate_username}")
-        
-        if custom_dimensions:
-            dimensions = custom_dimensions
-        else:
-            dimensions = POSTER_SIZE_DIMENSIONS.get(poster_size, POSTER_SIZE_DIMENSIONS["instagram-square"])
-        
-        # Create job in database
-        await database_service.create_batch_job(
-            job_id=job_id,
-            campaign_name=f"Single: {topmate_username}",
-            total_items=total_items,
-            template_html="",  # No template for AI generation
-            poster_size=poster_size,
-            model=model,
-            metadata={
-                "job_type": "single",
-                "topmate_username": topmate_username,
-                "prompt": prompt,
-                "reference_image": reference_image is not None,
-                "dimensions": dimensions,
-                **(metadata or {})
-            }
-        )
-        
-        await database_service.add_log(
-            job_id=job_id,
-            level="INFO",
-            message=f"Single AI job created for {topmate_username}",
-            details={"poster_size": poster_size, "model": model}
-        )
-        
-        # Publish to RedPanda queue
-        job_data = {
-            "job_type": "single",
-            "topmate_username": topmate_username,
-            "prompt": prompt,
-            "poster_size": poster_size,
-            "model": model,
-            "user_mode": user_mode,
-            "reference_image": reference_image,
-            "topmate_logo": topmate_logo,
-            "dimensions": dimensions,
-            "metadata": metadata or {}
-        }
-        
-        published = await redpanda_client.publish_job(job_id, job_data)
-        
-        print(f"🔴 [REDPANDA] Single AI job published to queue: {published}")
-        
-        if published:
-            print(f"✅ [JOB] Single AI Job {job_id} queued for RedPanda processing")
-            await database_service.update_job_status(job_id, "queued")
-        else:
-            print(f"⚠️ [JOB] RedPanda not available, processing single AI job {job_id} synchronously")
-            asyncio.create_task(self._process_single_ai_job({"job_id": job_id, **job_data}))
-        
-        return {
-            "job_id": job_id,
-            "status": "queued",
-            "total_items": total_items,
-            "created_at": datetime.utcnow().isoformat()
-        }
-    
-    async def _process_single_ai_job(self, job_data: Dict[str, Any]):
-        """Process a single AI poster generation job (3 variants)"""
-        job_id = job_data["job_id"]
-        start_time = time.time()
-        
-        print(f"")
-        print(f"{'='*60}")
-        print(f"🎨 [PROCESS] Starting single AI job: {job_id}")
-        print(f"{'='*60}")
-        
-        try:
-            await database_service.update_job_status(job_id, "processing")
-            await sse_manager.send_log(job_id, "INFO", "Starting AI poster generation")
-            
-            topmate_username = job_data.get("topmate_username")
-            prompt = job_data.get("prompt", "")
-            model = job_data.get("model", "flash")
-            user_mode = job_data.get("user_mode", "admin")
-            reference_image = job_data.get("reference_image")
-            topmate_logo = job_data.get("topmate_logo")
-            dimensions = job_data.get("dimensions", {"width": 1080, "height": 1080})
-            
-            # Fetch Topmate profile
-            print(f"📊 [PROCESS] Fetching profile for {topmate_username}...")
-            await sse_manager.send_progress(job_id, 0, 3, 0, 0, topmate_username, "fetching_profile")
-            
-            profile = await fetch_topmate_profile(topmate_username)
-            
-            # Select model
-            if user_mode == "expert":
-                model_id = "google/gemini-3-flash-preview"
-            else:
-                model_id = "google/gemini-3-flash-preview" if model == "flash" else "google/gemini-3-pro-preview"
-            
-            print(f"🤖 [PROCESS] Using model: {model_id}")
-            
-            # Get creative direction for Strategy C
-            creative_direction = None
-            if not reference_image:
-                try:
-                    print(f"🎨 [PROCESS] Getting creative direction...")
-                    await sse_manager.send_log(job_id, "INFO", "Getting AI creative direction")
-                    
-                    cd_prompt = f'Analyze this poster request and provide creative direction:\n\n"{prompt}"\n\nReturn ONLY valid JSON.'
-                    cd_response = await call_openrouter(
-                        model=model_id,
-                        system_prompt=CREATIVE_DIRECTOR_SYSTEM_PROMPT,
-                        user_prompt=cd_prompt,
-                        reference_image=None,
-                        max_tokens=2000
-                    )
-                    
-                    import json
-                    start_idx = cd_response.find('{')
-                    end_idx = cd_response.rfind('}') + 1
-                    if start_idx != -1 and end_idx > start_idx:
-                        creative_direction = json.loads(cd_response[start_idx:end_idx])
-                        print(f"✅ [PROCESS] Creative direction received")
-                except Exception as e:
-                    print(f"⚠️ [PROCESS] Creative direction failed: {e}")
-            
-            # Build strategies
-            strategies = []
-            for idx, strategy_template in enumerate(POSTER_STRATEGIES):
-                strategy = strategy_template.copy()
-                if strategy["name"] == "ai-creative-director":
-                    if creative_direction:
-                        strategy["directive"] = build_creative_directive(creative_direction)
-                    else:
-                        strategy["directive"] = FALLBACK_CREATIVE_DIRECTIVE
-                strategies.append(strategy)
-            
-            total_variants = len(strategies)
-            success_count = 0
-            failure_count = 0
-            results = []
-            
-            has_reference = bool(reference_image)
-            
-            for variant_idx, strategy in enumerate(strategies):
-                variant_name = strategy["name"]
-                print(f"🎨 [VARIANT {variant_idx + 1}/{total_variants}] Generating {variant_name}...")
-                await sse_manager.send_progress(job_id, variant_idx, total_variants, success_count, failure_count, variant_name, "generating")
-                await sse_manager.send_log(job_id, "INFO", f"Generating variant {variant_idx + 1}: {variant_name}")
-                
-                try:
-                    use_reference = has_reference and strategy["type"] == "reference"
-                    
-                    # Build user prompt
-                    user_prompt = f"""POSTER DIMENSIONS: {dimensions['width']}px × {dimensions['height']}px
-
-USER'S PROMPT (this is what matters):
-"{prompt}"
-
-CREATOR BRANDING (for subtle attribution only):
-- Name: {profile.display_name}
-- Photo URL: {profile.profile_pic}
-- Handle: @{profile.username}
-
-CONTEXT DATA (use only if prompt specifically needs it):
-- Bio: {profile.bio}
-- Stats: {profile.total_bookings} bookings, {profile.average_rating}/5 rating"""
-
-                    if profile.services:
-                        top_services = profile.services[:3]
-                        services_text = "\n".join(f"- {s.title}" for s in top_services)
-                        user_prompt += f"\n- Services:\n{services_text}"
-                    
-                    user_prompt += f"\n\nSTYLE DIRECTION: {strategy['directive']}\n\n"
-                    
-                    if use_reference:
-                        user_prompt += """REFERENCE IMAGE PROVIDED: Use it ONLY as VISUAL STYLE inspiration.
-⚠️ CRITICAL: Do NOT copy any text, brand names, logos from the reference."""
-                    
-                    user_prompt += "\n\nGenerate the HTML poster. Output only HTML starting with <!DOCTYPE html>"
-                    
-                    # Call OpenRouter
-                    html = await call_openrouter(
-                        model=model_id,
-                        system_prompt=POSTER_SYSTEM_PROMPT,
-                        user_prompt=user_prompt,
-                        reference_image=reference_image if use_reference else None,
-                        max_tokens=12000
-                    )
-                    
-                    # Clean HTML
-                    html = html.replace("```html\n", "").replace("```html", "")
-                    html = html.replace("```\n", "").replace("```", "").strip()
-                    if not html.startswith("<!DOCTYPE"):
-                        idx = html.find("<!DOCTYPE")
-                        if idx != -1:
-                            html = html[idx:]
-                    
-                    success_count += 1
-                    results.append({
-                        "variantIndex": variant_idx,
-                        "strategyName": variant_name,
-                        "success": True,
-                        "html": html,
-                        "dimensions": dimensions
-                    })
-                    
-                    print(f"✅ [VARIANT {variant_idx + 1}] Generated successfully")
-                    await sse_manager.send_poster_completed(job_id, variant_name, "", True)
-                    
-                except Exception as e:
-                    failure_count += 1
-                    error_msg = str(e)
-                    print(f"❌ [VARIANT {variant_idx + 1}] Failed: {error_msg[:50]}...")
-                    results.append({
-                        "variantIndex": variant_idx,
-                        "strategyName": variant_name,
-                        "success": False,
-                        "error": error_msg
-                    })
-                    await sse_manager.send_poster_completed(job_id, variant_name, "", False, error_msg)
-                
-                await sse_manager.send_progress(job_id, variant_idx + 1, total_variants, success_count, failure_count, variant_name, "processing")
-            
-            elapsed_time = time.time() - start_time
-            
-            print(f"")
-            print(f"{'='*60}")
-            print(f"🎉 [COMPLETE] Single AI Job {job_id} finished!")
-            print(f"   ✅ Success: {success_count}")
-            print(f"   ❌ Failed: {failure_count}")
-            print(f"   ⏱️ Time: {round(elapsed_time, 2)}s")
-            print(f"{'='*60}")
-            
-            await database_service.update_job_status(
-                job_id=job_id,
-                status="completed",
-                processed_items=total_variants,
-                success_count=success_count,
-                failure_count=failure_count
-            )
-            
-            # Send results with HTML included
-            await sse_manager.send_job_completed(job_id, success_count, failure_count, elapsed_time, results)
-            
-        except Exception as e:
-            logger.error("Single AI job failed", job_id=job_id, error=str(e))
-            print(f"💥 [ERROR] Single AI Job {job_id} FAILED: {str(e)}")
-            
-            await database_service.update_job_status(
-                job_id=job_id,
-                status="failed",
-                error_message=str(e)
-            )
-            await sse_manager.send_job_failed(job_id, str(e))
-    
-    async def _process_csv_job(self, job_data: Dict[str, Any]):
+    async def _process_csv_job_with_redpanda(self, job_data: Dict[str, Any]):
         """Process a CSV-based batch job"""
         job_id = job_data["job_id"]
         start_time = time.time()
-        
+
         print(f"")
         print(f"{'='*60}")
+        print(f"⚡ [WORKER {job_id}] TaskIQ worker picked up CSV job (t=0.000s)")
         print(f"🔄 [PROCESS] Starting CSV job processing: {job_id}")
         print(f"{'='*60}")
-        
+
         try:
             await database_service.update_job_status(job_id, "processing")
-            await sse_manager.send_log(job_id, "INFO", "CSV job processing started")
-            
+            elapsed = time.time() - start_time
+            print(f"💾 [WORKER {job_id}] Status updated to 'processing' (t={elapsed:.3f}s)")
+
             csv_data = job_data.get("csv_data", [])
             csv_template = job_data.get("csv_template", "")
             csv_columns = job_data.get("csv_columns", [])
             dimensions = job_data.get("dimensions", {"width": 1080, "height": 1080})
             topmate_logo = job_data.get("topmate_logo")
             skip_overlays = job_data.get("skip_overlays", False)
-            
+
             total_items = len(csv_data)
-            print(f"📋 [PROCESS] Job {job_id}: {total_items} CSV rows to process")
+            elapsed = time.time() - start_time
+            print(f"📋 [WORKER {job_id}] Parsed job data: {total_items} CSV rows to process (t={elapsed:.3f}s)")
             processed = 0
             success_count = 0
             failure_count = 0
             results = []
+
+            # Send initial progress immediately (0/total) so frontend shows it started
+            await sse_manager.send_progress(job_id, 0, total_items, 0, 0, None, "starting")
+            elapsed = time.time() - start_time
+            print(f"📡 [WORKER {job_id}] Initial SSE progress sent to frontend (t={elapsed:.3f}s)")
+            await sse_manager.send_log(job_id, "INFO", f"CSV job processing started - {total_items} posters to generate")
             
-            # Process in batches
-            BATCH_SIZE = 8
+            # Process in batches of 10 (parallel processing with RedPanda)
+            BATCH_SIZE = settings.batch_size  # 10 parallel jobs
             total_batches = (len(csv_data) + BATCH_SIZE - 1) // BATCH_SIZE
-            print(f"📦 [PROCESS] Processing {len(csv_data)} rows in {total_batches} batches")
+            print(f"📦 [PROCESS] Processing {len(csv_data)} rows in {total_batches} batches (batch size: {BATCH_SIZE})")
             
             for i in range(0, len(csv_data), BATCH_SIZE):
                 batch = csv_data[i:i + BATCH_SIZE]
                 batch_num = i // BATCH_SIZE + 1
-                
-                print(f"🔄 [BATCH {batch_num}/{total_batches}] Processing {len(batch)} rows...")
+
+                print(f"🔄 [BATCH {batch_num}/{total_batches}] Processing {len(batch)} rows in parallel...")
                 await sse_manager.send_log(job_id, "INFO", f"Processing batch {batch_num}/{total_batches}")
-                
+
+                # Create tasks for PARALLEL batch processing
+                tasks = []
                 for row in batch:
-                    username = row.get("username") or row.get("Username") or f"row_{processed+1}"
-                    try:
-                        result = await self._generate_csv_poster(
-                            job_id=job_id,
-                            row=row,
-                            csv_template=csv_template,
-                            csv_columns=csv_columns,
-                            dimensions=dimensions,
-                            topmate_logo=topmate_logo,
-                            skip_overlays=skip_overlays
-                        )
-                        
-                        processed += 1
-                        success_count += 1
-                        results.append(result)
-                        print(f"✅ [POSTER] Success: {username} ({processed}/{total_items})")
-                        await sse_manager.send_poster_completed(job_id, username, result.get("posterUrl", ""), True)
-                        await sse_manager.send_progress(job_id, processed, total_items, success_count, failure_count, username)
-                        
-                    except Exception as e:
-                        processed += 1
+                    task = self._generate_csv_poster(
+                        job_id=job_id,
+                        row=row,
+                        csv_template=csv_template,
+                        csv_columns=csv_columns,
+                        dimensions=dimensions,
+                        topmate_logo=topmate_logo,
+                        skip_overlays=skip_overlays
+                    )
+                    tasks.append(task)
+
+                # Execute batch in parallel using asyncio.gather
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Process results
+                for idx, result in enumerate(batch_results):
+                    processed += 1
+                    row = batch[idx]
+                    username = row.get("username") or row.get("Username") or f"row_{processed}"
+
+                    if isinstance(result, Exception):
                         failure_count += 1
-                        error_msg = str(e)
+                        error_msg = str(result)
                         print(f"❌ [POSTER] Failed: {username} - {error_msg[:50]}...")
+
+                        # Determine failure type
+                        failure_type = "unknown"
+                        if "Timeout" in error_msg:
+                            failure_type = "timeout"
+                        elif "HTML to PNG" in error_msg:
+                            failure_type = "html_conversion"
+                        elif "S3" in error_msg or "upload" in error_msg.lower():
+                            failure_type = "upload"
+
+                        # Log failure details to database
+                        await database_service.log_poster_failure(
+                            job_id=job_id,
+                            poster_id=None,
+                            user_identifier=username,
+                            username=username,
+                            failure_type=failure_type,
+                            error_message=error_msg,
+                            error_details={"row": row},
+                            html_template=csv_template
+                        )
+
                         results.append({"username": username, "success": False, "error": error_msg})
                         await sse_manager.send_poster_completed(job_id, username, "", False, error_msg)
-                        await sse_manager.send_progress(job_id, processed, total_items, success_count, failure_count, username)
-                
-                await database_service.update_job_status(
-                    job_id=job_id,
-                    status="processing",
-                    processed_items=processed,
-                    success_count=success_count,
-                    failure_count=failure_count
-                )
+                    else:
+                        success_count += 1
+                        print(f"✅ [POSTER] Success: {username} ({processed}/{total_items})")
+                        results.append(result)
+                        await sse_manager.send_poster_completed(job_id, username, result.get("posterUrl", ""), True)
+
+                    # Send progress update for EACH poster
+                    await sse_manager.send_progress(job_id, processed, total_items, success_count, failure_count, username)
+
+                    # Update database for EACH poster (so progress is real-time)
+                    await database_service.update_job_status(
+                        job_id=job_id,
+                        status="processing",
+                        processed_items=processed,
+                        success_count=success_count,
+                        failure_count=failure_count
+                    )
+
+                # Brief delay between batches
                 await asyncio.sleep(0.5)
             
             elapsed_time = time.time() - start_time
@@ -1026,40 +849,101 @@ CONTEXT DATA (use only if prompt specifically needs it):
         """Generate a single poster from CSV row data"""
         start_time = time.time()
         username = row.get("username") or row.get("Username") or "unknown"
-        
-        # Create poster record
+
+        # Extract user_id from CSV (case-insensitive, whitespace-tolerant)
+        user_id = None
+        for key, value in row.items():
+            normalized_key = key.strip().lower().replace(" ", "")
+            if normalized_key in ["user_id", "userid", "id"]:
+                user_id = value
+                break
+
+        # Clean and validate user_id
+        if user_id:
+            # Remove whitespace and convert to string first
+            user_id_str = str(user_id).strip()
+            # Check if it's not empty and not just "None"
+            if user_id_str and user_id_str.lower() != "none":
+                try:
+                    user_id = int(float(user_id_str))  # Handle both "123" and "123.0"
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid user_id format: {user_id_str} for user {username}")
+                    user_id = None
+            else:
+                user_id = None
+
+        # If no user_id in CSV, fetch from Topmate API
+        topmate_profile = None
+        if not user_id:
+            print(f"🔍 [CSV-POSTER {username}] No user_id in CSV - fetching from Topmate API...")
+            try:
+                from app.services.topmate_client import fetch_topmate_profile
+                topmate_profile = await fetch_topmate_profile(username)
+                if topmate_profile:
+                    user_id = topmate_profile.user_id
+                    print(f"✅ [CSV-POSTER {username}] Fetched from Topmate API: user_id={user_id}")
+                else:
+                    print(f"⚠️ [CSV-POSTER {username}] Profile not found on Topmate")
+            except Exception as e:
+                print(f"❌ [CSV-POSTER {username}] Failed to fetch from Topmate API: {e}")
+
+        # Create metadata with user_id and profile data
+        metadata = {}
+        if user_id:
+            metadata["user_id"] = user_id
+        if topmate_profile:
+            # Store full profile data for later use
+            metadata["display_name"] = topmate_profile.display_name
+            metadata["profile_pic"] = topmate_profile.profile_pic
+            metadata["bio"] = topmate_profile.bio
+            metadata["fetched_from_api"] = True
+
+        # Debug logging
+        if user_id:
+            print(f"✅ [CSV-POSTER {username}] user_id: {user_id} (from {'CSV' if not topmate_profile else 'Topmate API'})")
+        else:
+            print(f"⚠️ [CSV-POSTER {username}] No user_id available - poster will NOT be saveable to database")
+
+        # Get display_name from topmate_profile, CSV, or fallback to username
+        display_name = row.get("display_name") or row.get("name") or username
+        if topmate_profile and topmate_profile.display_name:
+            display_name = topmate_profile.display_name
+
         poster_id = await database_service.create_poster_record(
             job_id=job_id,
             user_identifier=username,
             username=username,
-            display_name=row.get("display_name") or row.get("name") or username
+            display_name=display_name,
+            metadata=metadata
         )
+
+        print(f"💾 [CSV-POSTER {username}] Poster record created (ID: {poster_id})")
+        print(f"📋 [CSV-POSTER {username}] Metadata: {metadata}")
         
         # Replace placeholders in template
         filled_html = replace_placeholders(csv_template, row, csv_columns)
         
-        # Convert HTML to PNG (returns data URL)
-        image_data_url = await convert_html_to_png(
+        # Convert HTML to PNG
+        image_bytes = await convert_html_to_png(
             html=filled_html,
             dimensions=dimensions
         )
         
-        if not image_data_url:
+        if not image_bytes:
             raise Exception("Failed to convert HTML to image")
         
         # Apply overlays if needed
         if not skip_overlays and topmate_logo:
-            image_data_url = await overlay_logo_and_profile(
-                base_image_url=image_data_url,
-                logo_url=topmate_logo,
-                profile_pic_url=None,
-                dimensions=dimensions
+            image_bytes = await overlay_logo_and_profile(
+                base_image_bytes=image_bytes,
+                topmate_logo=topmate_logo,
+                profile_image=None
             )
         
-        # Upload to S3 (upload_image takes data_url, filename and returns URL string)
-        poster_url = await upload_image(
-            image_data_url,
-            f"{job_id}/{username}_{int(time.time())}.png"
+        # Upload to S3
+        s3_result = await upload_image(
+            image_bytes=image_bytes,
+            filename=f"{job_id}/{username}_{int(time.time())}.png"
         )
         
         processing_time_ms = int((time.time() - start_time) * 1000)
@@ -1067,18 +951,114 @@ CONTEXT DATA (use only if prompt specifically needs it):
         await database_service.update_poster_status(
             poster_id=poster_id,
             status="completed",
-            poster_url=poster_url,
-            s3_key=None,
+            poster_url=s3_result.get("url"),
+            s3_key=s3_result.get("key"),
             processing_time_ms=processing_time_ms
         )
         
         return {
             "username": username,
             "success": True,
-            "posterUrl": poster_url,
-            "s3Key": None,
+            "posterUrl": s3_result.get("url"),
+            "s3Key": s3_result.get("key"),
             "processingTimeMs": processing_time_ms
         }
+
+    async def _process_template_poster(self, message: Dict[str, Any]):
+        """
+        Process a single template poster job from RedPanda
+        Called when a template_poster message is received from the queue
+        """
+        parent_job_id = message.get("parent_job_id")
+        template_id = message.get("template_id")
+        custom_data = message.get("custom_data", {})
+        metadata = message.get("metadata", {})
+
+        print(f"🎨 [TEMPLATE] Processing template poster: {parent_job_id}")
+        logger.info("Processing template poster", parent_job_id=parent_job_id, template_id=template_id)
+
+        try:
+            # Import the task and execute it
+            from app.tasks.poster_tasks import process_template_poster_task
+
+            # Call the task directly (already in RedPanda consumer, no need to re-queue)
+            result = await process_template_poster_task.kicker()(
+                job_id=parent_job_id,
+                template_id=template_id,
+                custom_data=custom_data,
+                metadata=metadata
+            )
+
+            # Update parent job progress
+            if parent_job_id:
+                await self._update_template_job_progress(parent_job_id, success=result.get("success", False))
+
+            logger.info("Template poster completed", parent_job_id=parent_job_id, success=result.get("success"))
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error("Template poster failed", parent_job_id=parent_job_id, error=error_msg)
+
+            # Update parent job progress
+            if parent_job_id:
+                await self._update_template_job_progress(parent_job_id, success=False)
+
+    async def _update_template_job_progress(self, job_id: str, success: bool):
+        """Update progress counters for template generation job"""
+        try:
+            if success:
+                await database_service.execute(
+                    """
+                    UPDATE template_generation_jobs
+                    SET processed_items = processed_items + 1,
+                        success_count = success_count + 1
+                    WHERE job_id = $1
+                    """,
+                    job_id
+                )
+            else:
+                await database_service.execute(
+                    """
+                    UPDATE template_generation_jobs
+                    SET processed_items = processed_items + 1,
+                        failure_count = failure_count + 1
+                    WHERE job_id = $1
+                    """,
+                    job_id
+                )
+
+            # Check if job is complete
+            job = await database_service.fetchrow(
+                """
+                SELECT total_items, processed_items
+                FROM template_generation_jobs
+                WHERE job_id = $1
+                """,
+                job_id
+            )
+
+            if job and job['processed_items'] >= job['total_items']:
+                # Mark job as completed
+                await database_service.execute(
+                    """
+                    UPDATE template_generation_jobs
+                    SET status = 'completed', completed_at = NOW()
+                    WHERE job_id = $1
+                    """,
+                    job_id
+                )
+
+                # Send completion event via SSE
+                await sse_manager.send_job_completed(
+                    job_id=job_id,
+                    success_count=job['processed_items'],
+                    total_count=job['total_items']
+                )
+
+                logger.info("Template job completed", job_id=job_id)
+
+        except Exception as e:
+            logger.error("Failed to update template job progress", job_id=job_id, error=str(e))
 
 
 # Global singleton instance

@@ -1,0 +1,12 @@
+{
+  "section": "testimonial",
+  "name": "Test Testimonial Template",
+  "html_content": "<div style='width: 1200px; height: 630px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 40px; box-sizing: border-box;'><h1 style='color: white; font-size: 48px; margin-bottom: 20px; text-align: center;'>{{consumer_name}}</h1><p style='color: white; font-size: 24px; text-align: center; max-width: 800px; line-height: 1.5;'>\"{{consumer_message}}\"</p><div style='color: rgba(255,255,255,0.8); font-size: 18px; margin-top: 30px;'>Rating: {{rating}}/5</div></div>",
+  "css_content": "",
+  "preview_data": {
+    "consumer_name": "John Doe",
+    "consumer_message": "This is an amazing service! Highly recommended.",
+    "rating": "5.0"
+  },
+  "set_as_active": true
+}

@@ -1,0 +1,12 @@
+{
+  "template_id": "testimonial_latest",
+  "custom_data": {
+    "consumer_name": "Jane Smith",
+    "consumer_message": "Excellent mentorship session! Very insightful and helpful.",
+    "rating": "5.0"
+  },
+  "metadata": {
+    "user_id": 123,
+    "testimonial_id": "test_001"
+  }
+}

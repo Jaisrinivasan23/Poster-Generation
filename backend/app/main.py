@@ -23,11 +23,14 @@ from app.routers import (
     upload_s3,
     edit_poster,
     batch_processing,
+    templates,
 )
 from app.services.html_to_image import initialize_converter, close_converter
 from app.services.database import database_service
 from app.services.redpanda_client import redpanda_client
 from app.services.job_manager import job_manager
+from app.services.taskiq_broker import startup_broker, shutdown_broker
+from app.services.sse_manager import sse_manager
 
 # Configure structlog
 structlog.configure(
@@ -67,19 +70,33 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("Database initialization error", error=str(e))
     
+    # Initialize TaskIQ broker
+    try:
+        await startup_broker()
+        logger.info("TaskIQ broker initialized successfully")
+    except Exception as e:
+        logger.error("TaskIQ initialization error", error=str(e))
+
+    # Initialize SSE Manager with Redis pub/sub
+    try:
+        await sse_manager.initialize()
+        logger.info("SSE Manager initialized successfully with Redis pub/sub")
+    except Exception as e:
+        logger.error("SSE Manager initialization error", error=str(e))
+
     # Initialize RedPanda
     try:
         rp_initialized = await redpanda_client.initialize()
         if rp_initialized:
             logger.info("RedPanda initialized successfully")
-            # Start job manager
+            # Start job manager (for RedPanda consumer)
             await job_manager.start()
             logger.info("Job manager started")
         else:
             logger.warning("RedPanda initialization failed - batch jobs will run synchronously")
     except Exception as e:
         logger.error("RedPanda initialization error", error=str(e))
-    
+
     # Note: Playwright initializes lazily on first use (Windows compatibility)
     logger.info("Startup complete")
 
@@ -87,19 +104,25 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down...")
-    
+
     # Stop job manager
     await job_manager.stop()
-    
+
+    # Shutdown SSE Manager
+    await sse_manager.close()
+
+    # Shutdown TaskIQ broker
+    await shutdown_broker()
+
     # Close RedPanda
     await redpanda_client.close()
-    
+
     # Close database
     await database_service.close()
-    
+
     # Close Playwright browser if initialized
     await close_converter()
-    
+
     logger.info("Shutdown complete")
 
 
@@ -156,6 +179,7 @@ app.include_router(generate_image.router, prefix="/api", tags=["Generate Image"]
 app.include_router(generate_template.router, prefix="/api", tags=["Generate Template"])
 app.include_router(upload_s3.router, prefix="/api", tags=["Upload S3"])
 app.include_router(batch_processing.router, prefix="/api", tags=["Batch Processing"])
+app.include_router(templates.router, prefix="/api", tags=["Templates"])
 
 # Global exception handler
 @app.exception_handler(Exception)

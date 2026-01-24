@@ -22,9 +22,15 @@ const BACKEND_ENDPOINTS = [
   '/api/generate-template',
   '/api/upload-s3',
   '/api/save-local',
+  '/api/edit-poster',
+  '/api/poster-chat',
   // Batch Processing with RedPanda + SSE
   '/api/batch/jobs',
   '/api/batch/health',
+  // Template Management
+  '/api/templates/upload',
+  '/api/templates/generate',
+  '/api/templates',
 ];
 
 /**
@@ -310,6 +316,208 @@ export async function checkBatchHealth(): Promise<{
   if (!response.ok) {
     const error = await response.json();
     throw new Error(error.detail || 'Failed to check health');
+  }
+
+  return response.json();
+}
+
+// ============ Template Management API ============
+
+export interface TemplatePlaceholder {
+  name: string;
+  sample_value?: string;
+  data_type?: string;
+  is_required?: boolean;
+}
+
+export interface Template {
+  id: string;
+  section: string;
+  name: string;
+  version: number;
+  is_active: boolean;
+  html_content?: string;
+  css_content?: string;
+  placeholders: TemplatePlaceholder[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UploadTemplateParams {
+  section: string;
+  name: string;
+  html_content: string;
+  css_content?: string;
+  set_as_active?: boolean;
+}
+
+export interface GenerateFromTemplateParams {
+  template_id: string;
+  custom_data: Record<string, string>;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TemplateJobResult {
+  entity_id: string;
+  url: string;
+  status: string;
+  generation_time_ms?: number;
+  error?: string;
+}
+
+export interface TemplateJobStatus {
+  job_id: string;
+  status: string;
+  template_section: string;
+  template_version: number;
+  total_items: number;
+  processed_items: number;
+  success_count: number;
+  failure_count: number;
+  created_at: string;
+  started_at?: string;
+  completed_at?: string;
+  results: TemplateJobResult[];
+}
+
+/**
+ * Upload a new template
+ * @param params - Template upload parameters
+ * @returns Uploaded template details
+ */
+export async function uploadTemplate(params: UploadTemplateParams): Promise<{
+  template_id: string;
+  version: number;
+  section: string;
+  placeholders: TemplatePlaceholder[];
+  message: string;
+}> {
+  const response = await apiFetch('/api/templates/upload', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(params),
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || 'Failed to upload template');
+  }
+
+  return response.json();
+}
+
+/**
+ * List all templates with optional section filter
+ * @param section - Optional section filter
+ * @returns List of templates
+ */
+export async function listTemplates(section?: string): Promise<{
+  section: string;
+  templates: Template[];
+  active_template?: Template;
+}> {
+  const params = section ? `?section=${encodeURIComponent(section)}` : '';
+  const response = await apiFetch(`/api/templates${params}`, {
+    method: 'GET',
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || 'Failed to list templates');
+  }
+
+  return response.json();
+}
+
+/**
+ * Generate poster from template (async)
+ * @param params - Generation parameters
+ * @returns Job ID and status endpoint
+ */
+export async function generateFromTemplate(params: GenerateFromTemplateParams): Promise<{
+  success: boolean;
+  job_id: string;
+  message: string;
+  status_endpoint: string;
+}> {
+  const response = await apiFetch('/api/templates/generate', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(params),
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || 'Failed to generate poster');
+  }
+
+  return response.json();
+}
+
+/**
+ * Get template job status
+ * @param jobId - Template generation job ID
+ * @returns Job status and results
+ */
+export async function getTemplateJobStatus(jobId: string): Promise<TemplateJobStatus> {
+  const response = await apiFetch(`/api/templates/job/${jobId}`, {
+    method: 'GET',
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || 'Failed to get job status');
+  }
+
+  return response.json();
+}
+
+/**
+ * Activate a specific template version
+ * @param templateId - Template ID to activate
+ * @returns Activated template details
+ */
+export async function activateTemplate(templateId: string): Promise<{
+  template_id: string;
+  section: string;
+  version: number;
+  is_active: boolean;
+  message: string;
+}> {
+  const response = await apiFetch(`/api/templates/${templateId}/activate`, {
+    method: 'POST',
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || 'Failed to activate template');
+  }
+
+  return response.json();
+}
+
+/**
+ * Preview a template with sample data
+ * @param templateId - Template ID to preview
+ * @returns Template preview HTML
+ */
+export async function previewTemplate(templateId: string): Promise<{
+  template_id: string;
+  section: string;
+  name: string;
+  preview_html: string;
+}> {
+  const response = await apiFetch(`/api/templates/${templateId}/preview`, {
+    method: 'GET',
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || 'Failed to preview template');
   }
 
   return response.json();

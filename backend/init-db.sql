@@ -90,6 +90,28 @@ CREATE TRIGGER update_generated_posters_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+-- Poster Failure Details Table
+CREATE TABLE IF NOT EXISTS poster_failure_details (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    job_id VARCHAR(100) NOT NULL,
+    poster_id UUID,
+    user_identifier VARCHAR(255),
+    username VARCHAR(255),
+    failure_type VARCHAR(100),
+    error_message TEXT,
+    error_details JSONB DEFAULT '{}',
+    retry_count INTEGER DEFAULT 0,
+    html_template TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (poster_id) REFERENCES generated_posters(id) ON DELETE CASCADE
+);
+
+-- Create indexes for failure details
+CREATE INDEX IF NOT EXISTS idx_failure_details_job_id ON poster_failure_details(job_id);
+CREATE INDEX IF NOT EXISTS idx_failure_details_poster_id ON poster_failure_details(poster_id);
+CREATE INDEX IF NOT EXISTS idx_failure_details_failure_type ON poster_failure_details(failure_type);
+CREATE INDEX IF NOT EXISTS idx_failure_details_created_at ON poster_failure_details(created_at DESC);
+
 -- Insert initial log
-INSERT INTO job_logs (job_id, level, message, details) 
+INSERT INTO job_logs (job_id, level, message, details)
 VALUES ('system', 'INFO', 'Database initialized successfully', ('{"version": "1.0.0", "timestamp": "' || CURRENT_TIMESTAMP || '"}')::jsonb);

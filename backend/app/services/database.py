@@ -239,18 +239,19 @@ class DatabaseService:
         job_id: str,
         user_identifier: str,
         username: Optional[str] = None,
-        display_name: Optional[str] = None
+        display_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> str:
         """Create a pending poster record"""
         async with self.connection() as conn:
             result = await conn.fetchrow(
                 """
                 INSERT INTO generated_posters (
-                    job_id, user_identifier, username, display_name, status
-                ) VALUES ($1, $2, $3, $4, 'pending')
+                    job_id, user_identifier, username, display_name, status, metadata
+                ) VALUES ($1, $2, $3, $4, 'pending', $5)
                 RETURNING id
                 """,
-                job_id, user_identifier, username, display_name
+                job_id, user_identifier, username, display_name, json.dumps(metadata or {})
             )
             return str(result['id'])
     
@@ -330,6 +331,74 @@ class DatabaseService:
             )
             return dict(row) if row else {}
     
+    async def log_poster_failure(
+        self,
+        job_id: str,
+        poster_id: Optional[str],
+        user_identifier: str,
+        username: str,
+        failure_type: str,
+        error_message: str,
+        error_details: Optional[Dict[str, Any]] = None,
+        html_template: Optional[str] = None
+    ):
+        """Log poster generation failure details"""
+        async with self.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO poster_failure_details (
+                    job_id, poster_id, user_identifier, username,
+                    failure_type, error_message, error_details, html_template
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                job_id,
+                poster_id if poster_id else None,
+                user_identifier,
+                username,
+                failure_type,
+                error_message,
+                json.dumps(error_details or {}),
+                html_template
+            )
+
+    async def log_save_failure(
+        self,
+        save_job_id: str,
+        username: str,
+        poster_url: str,
+        error_message: str,
+        error_type: str = "save_to_topmate_db_failed"
+    ):
+        """Log failure when saving poster to Topmate DB"""
+        async with self.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO poster_failure_details (
+                    job_id, user_identifier, username,
+                    failure_type, error_message, error_details
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                save_job_id,
+                username,
+                username,
+                error_type,
+                error_message,
+                json.dumps({"poster_url": poster_url, "save_stage": "topmate_db"})
+            )
+
+    async def get_job_failures(self, job_id: str) -> List[Dict[str, Any]]:
+        """Get all failure details for a job"""
+        async with self.connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM poster_failure_details
+                WHERE job_id = $1
+                ORDER BY created_at DESC
+                """,
+                job_id
+            )
+            return [dict(row) for row in rows]
+
     @property
     def is_healthy(self) -> bool:
         """Check if database is healthy"""

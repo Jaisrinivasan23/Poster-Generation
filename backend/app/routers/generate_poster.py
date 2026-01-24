@@ -151,7 +151,6 @@ async def generate_poster(request: GeneratePosterRequest):
         if not request.referenceImage:
             # Only run creative director if no reference image
             creative_direction = await get_creative_direction(
-                api_key="",  # Will use from config
                 model=model_id,
                 prompt=config.prompt
             )

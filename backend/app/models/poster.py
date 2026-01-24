@@ -194,9 +194,20 @@ class GenerateBulkResponse(BaseModel):
 
 # Save Bulk Posters Models
 class SavePosterItem(BaseModel):
-    userId: Optional[str] = None
+    userId: Optional[Union[str, int]] = None
     username: str
     posterUrl: str
+
+    @field_validator('userId', mode='before')
+    @classmethod
+    def convert_user_id_to_int(cls, v):
+        """Convert userId to int for processing"""
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return None
 
 
 class SaveBulkPostersRequest(BaseModel):

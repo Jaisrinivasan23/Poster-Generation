@@ -3,10 +3,13 @@ Batch Processing Router with SSE
 Handles batch poster generation with real-time progress updates
 """
 import uuid
+import asyncio
+import json
 from typing import Optional
+from datetime import datetime
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from sse_starlette.sse import EventSourceResponse
+from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any
 
@@ -145,16 +148,77 @@ async def stream_job_progress(job_id: str, request: Request):
     
     async def event_generator():
         try:
-            async for event in sse_manager.event_generator(connection):
+            heartbeat_count = 0
+
+            while True:
                 # Check if client disconnected
                 if await request.is_disconnected():
+                    logger.info("SSE client disconnected", job_id=job_id)
                     break
-                yield event
+
+                # Try to get event from queue with very long timeout (no timeout errors)
+                try:
+                    event = await asyncio.wait_for(connection.queue.get(), timeout=300.0)  # 5 minutes
+
+                    # Yield the event
+                    yield ServerSentEvent(
+                        data=json.dumps(event["data"]),
+                        event=event["event"]
+                    )
+
+                    # Check if job completed/failed
+                    if event["event"] in ("job_completed", "job_failed"):
+                        logger.info("Job finished, ending SSE stream", job_id=job_id, event=event["event"])
+                        break
+
+                except asyncio.TimeoutError:
+                    # No events in queue, send heartbeat to keep connection alive
+                    heartbeat_count += 1
+                    if heartbeat_count % 6 == 0:  # Every 30 seconds (6 * 5 seconds)
+                        yield ServerSentEvent(
+                            data=json.dumps({"status": "alive", "timestamp": datetime.utcnow().isoformat()}),
+                            event="heartbeat"
+                        )
+
+                    # Also check job status from database as backup
+                    current_job = await job_manager.get_job_status(job_id)
+                    if not current_job:
+                        logger.warning("Job not found during SSE stream", job_id=job_id)
+                        break
+
+                    if current_job.get("status") in ("completed", "failed"):
+                        # Send completion event if we missed it
+                        event_type = "job_completed" if current_job.get("status") == "completed" else "job_failed"
+                        completion_data = {
+                            "job_id": job_id,
+                            "success_count": current_job.get("success_count", 0),
+                            "failure_count": current_job.get("failure_count", 0),
+                            "total_time_seconds": 0,
+                            "results": []
+                        }
+                        if event_type == "job_failed":
+                            completion_data["error"] = current_job.get("error_message", "Unknown error")
+
+                        yield ServerSentEvent(
+                            data=json.dumps(completion_data),
+                            event=event_type
+                        )
+                        logger.info("Job finished (backup check), ending SSE stream", job_id=job_id)
+                        break
+
         except Exception as e:
             logger.error("SSE stream error", job_id=job_id, error=str(e))
+            try:
+                yield ServerSentEvent(
+                    data=json.dumps({"error": str(e)}),
+                    event="error"
+                )
+            except:
+                pass
         finally:
             await sse_manager.disconnect(connection_id)
-    
+            logger.info("SSE connection closed", job_id=job_id, connection_id=connection_id)
+
     return EventSourceResponse(event_generator())
 
 
@@ -176,15 +240,15 @@ async def get_job_status(job_id: str):
 async def get_job_results(job_id: str):
     """Get results for a completed batch job"""
     job = await job_manager.get_job_status(job_id)
-    
+
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     results = await job_manager.get_job_results(job_id)
-    
+
     success_count = sum(1 for r in results if r.get("success"))
     failure_count = len(results) - success_count
-    
+
     return JobResultsResponse(
         success=True,
         jobId=job_id,
@@ -192,6 +256,73 @@ async def get_job_results(job_id: str):
         successCount=success_count,
         failureCount=failure_count
     )
+
+
+@router.get("/batch/jobs/{job_id}/posters-for-save")
+async def get_posters_for_save(job_id: str):
+    """
+    Get all generated posters formatted for save-bulk-posters endpoint
+
+    Returns poster data in the format expected by /api/save-bulk-posters:
+    {
+        "posters": [
+            {
+                "username": "johndoe",
+                "posterUrl": "https://...",
+                "userId": 12345  // optional, will lookup if not provided
+            }
+        ]
+    }
+    """
+    job = await job_manager.get_job_status(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Get all generated posters from database
+    posters = await database_service.get_job_posters(job_id)
+
+    # Filter only successful posters and format for save endpoint
+    formatted_posters = []
+    missing_user_ids = []
+
+    for poster in posters:
+        if poster.get("status") == "completed" and poster.get("poster_url"):
+            # Extract user_id from metadata (stored during generation)
+            metadata = poster.get("metadata", {})
+            if isinstance(metadata, str):
+                import json
+                try:
+                    metadata = json.loads(metadata)
+                except:
+                    metadata = {}
+
+            user_id = metadata.get("user_id")
+
+            if user_id:
+                formatted_posters.append({
+                    "username": poster.get("username"),
+                    "posterUrl": poster.get("poster_url"),
+                    "userId": int(user_id)
+                })
+            else:
+                missing_user_ids.append(poster.get("username"))
+
+    # If any posters missing user_id, include warning
+    warning = None
+    if missing_user_ids:
+        warning = f"⚠️ {len(missing_user_ids)} posters missing user_id. Please upload CSV with 'user_id' column."
+
+    return {
+        "success": True,
+        "jobId": job_id,
+        "campaignName": job.get("campaign_name"),
+        "totalPosters": len(formatted_posters),
+        "totalMissingUserId": len(missing_user_ids),
+        "missingUserIdPosters": missing_user_ids[:10] if missing_user_ids else [],  # Show first 10
+        "warning": warning,
+        "posters": formatted_posters
+    }
 
 
 @router.get("/batch/jobs/{job_id}/logs")
@@ -262,7 +393,7 @@ async def list_jobs(
 async def batch_health_check():
     """Check health of batch processing services"""
     from app.services.redpanda_client import redpanda_client
-    
+
     return {
         "success": True,
         "services": {
@@ -271,3 +402,59 @@ async def batch_health_check():
             "sse_connections": sse_manager.get_connection_count()
         }
     }
+
+
+@router.post("/batch/log-frontend-error")
+async def log_frontend_error(request: dict):
+    """
+    Log frontend errors to PostgreSQL database
+
+    Request body:
+    {
+        "jobId": "job_xxx",
+        "errorType": "sse_error",
+        "errorMessage": "Connection failed",
+        "errorStack": "...",
+        "userAgent": "...",
+        "url": "...",
+        "timestamp": "2026-01-21T12:00:00"
+    }
+    """
+    try:
+        job_id = request.get("jobId", "frontend")
+        error_type = request.get("errorType", "unknown")
+        error_message = request.get("errorMessage", "No message")
+        error_stack = request.get("errorStack")
+        user_agent = request.get("userAgent")
+        url = request.get("url")
+        timestamp = request.get("timestamp")
+
+        # Log to database as job log
+        await database_service.add_log(
+            job_id=job_id,
+            level="ERROR",
+            message=f"[FRONTEND ERROR] {error_type}: {error_message}",
+            details={
+                "error_type": error_type,
+                "error_message": error_message,
+                "error_stack": error_stack,
+                "user_agent": user_agent,
+                "url": url,
+                "timestamp": timestamp,
+                "source": "frontend"
+            }
+        )
+
+        logger.error("Frontend error logged",
+                    job_id=job_id,
+                    error_type=error_type,
+                    error_message=error_message)
+
+        return {
+            "success": True,
+            "message": "Frontend error logged to database"
+        }
+
+    except Exception as e:
+        logger.error("Failed to log frontend error", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))

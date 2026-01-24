@@ -51,8 +51,9 @@ class HTMLToImageConverter:
         html: str,
         width: int,
         height: int,
-        scale: float = 1.0
-    ) -> str:
+        scale: float = 1.0,
+        timeout: int = 60000
+    ) -> bytes:
         """
         Convert HTML to PNG using Playwright
 
@@ -61,14 +62,16 @@ class HTMLToImageConverter:
             width: Image width in pixels
             height: Image height in pixels
             scale: Device scale factor (1.0 = standard, 2.0 = high-res)
+            timeout: Timeout in milliseconds (default: 60000ms = 60 seconds)
 
         Returns:
-            Base64 data URL (data:image/png;base64,...)
+            PNG image as bytes
         """
         # Lazy initialization if not already done
         if not self._browser:
             await self.initialize()
 
+        page = None
         try:
             # Create new page with exact viewport
             page = await self._browser.new_page(
@@ -76,8 +79,17 @@ class HTMLToImageConverter:
                 device_scale_factor=scale
             )
 
-            # Set content and wait for it to load
-            await page.set_content(html, wait_until='networkidle')
+            # Set default timeout for this page
+            page.set_default_timeout(timeout)
+
+            # Set content and wait for network to be idle (ensures all resources loaded)
+            await page.set_content(html, wait_until='networkidle', timeout=timeout)
+
+            # Wait for fonts to be ready (important for first batch)
+            await page.evaluate('document.fonts.ready')
+
+            # Additional wait to ensure everything is rendered properly
+            await page.wait_for_timeout(1500)
 
             # Take screenshot with exact dimensions
             screenshot_bytes = await page.screenshot(
@@ -88,25 +100,26 @@ class HTMLToImageConverter:
                     'y': 0,
                     'width': width,
                     'height': height
-                }
+                },
+                timeout=timeout
             )
-
-            # Close page
-            await page.close()
-
-            # Convert to base64 data URL
-            base64_image = base64.b64encode(screenshot_bytes).decode('utf-8')
-            data_url = f"data:image/png;base64,{base64_image}"
 
             print(f"[HTML2PNG] Screenshot captured: {len(screenshot_bytes)} bytes")
 
-            return data_url
+            return screenshot_bytes
 
         except Exception as e:
             import traceback
             print(f"[HTML2PNG] Conversion failed: {e}")
             print(f"[HTML2PNG] Traceback: {traceback.format_exc()}")
             raise Exception(f"HTML to PNG conversion failed: {str(e)}")
+        finally:
+            # Always close page
+            if page:
+                try:
+                    await page.close()
+                except:
+                    pass
 
 
 # Global converter instance
@@ -116,8 +129,9 @@ _converter = HTMLToImageConverter()
 async def convert_html_to_png(
     html: str,
     dimensions: Dict[str, int],
-    scale: float = 1.0
-) -> str:
+    scale: float = 1.0,
+    timeout: int = 60000
+) -> bytes:
     """
     Convert HTML to PNG (convenience function)
 
@@ -125,20 +139,21 @@ async def convert_html_to_png(
         html: HTML string
         dimensions: Dict with 'width' and 'height' keys
         scale: Device scale factor (1.0 = standard, 2.0 = high-res)
+        timeout: Timeout in milliseconds (default: 60000ms)
 
     Returns:
-        Base64 data URL
+        PNG image as bytes
 
     Example:
         >>> html = "<!DOCTYPE html><html>...</html>"
-        >>> data_url = await convert_html_to_png(html, {"width": 1080, "height": 1080})
-        >>> # data_url = "data:image/png;base64,iVBORw0KG..."
+        >>> image_bytes = await convert_html_to_png(html, {"width": 1080, "height": 1080})
     """
     return await _converter.html_to_png(
         html=html,
         width=dimensions['width'],
         height=dimensions['height'],
-        scale=scale
+        scale=scale,
+        timeout=timeout
     )
 
 
@@ -156,8 +171,9 @@ async def close_converter():
 async def convert_html_batch(
     html_list: list[str],
     dimensions: Dict[str, int],
-    scale: float = 1.0
-) -> list[str]:
+    scale: float = 1.0,
+    timeout: int = 60000
+) -> list[bytes]:
     """
     Convert multiple HTMLs to PNG in parallel
 
@@ -165,12 +181,13 @@ async def convert_html_batch(
         html_list: List of HTML strings
         dimensions: Image dimensions
         scale: Device scale factor
+        timeout: Timeout in milliseconds
 
     Returns:
-        List of base64 data URLs
+        List of PNG bytes
     """
     tasks = [
-        convert_html_to_png(html, dimensions, scale)
+        convert_html_to_png(html, dimensions, scale, timeout)
         for html in html_list
     ]
     return await asyncio.gather(*tasks)
