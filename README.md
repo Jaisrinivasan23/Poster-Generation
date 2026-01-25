@@ -5,7 +5,7 @@ AI-powered poster generation tool integrated with Topmate profiles. Create stunn
 ## Features
 
 - 🎨 **Single Poster Creation** - Generate personalized posters from Topmate profiles
-- 📊 **Smart Data Analysis** - AI analyzes your prompt to suggest relevant profile data
+-  **Smart Data Analysis** - AI analyzes your prompt to suggest relevant profile data
 - 🖼️ **Reference Image Support** - Upload design references or choose from templates
 - 📱 **Multiple Formats** - Instagram Square, Story, Carousel support
 - 🔄 **Bulk Generation** - Generate posters for multiple users via CSV

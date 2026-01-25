@@ -40,7 +40,7 @@ async def save_bulk_posters(request: SaveBulkPostersRequest):
         
         print(f"\n{'='*60}")
         print(f"💾 [SAVE-BULK] Starting save job: {job_id}")
-        print(f"📊 [SAVE-BULK] Total posters to save: {total_posters}")
+        print(f" [SAVE-BULK] Total posters to save: {total_posters}")
         print(f"{'='*60}\n")
         
         # Initialize job state
@@ -315,7 +315,7 @@ async def _process_save_job(job_id: str, request: SaveBulkPostersRequest):
         
         print(f"\n{'='*60}")
         print(f"✅ [SAVE-BULK] Job {job_id} completed!")
-        print(f"📊 Success: {job['success']}/{job['total']}")
+        print(f" Success: {job['success']}/{job['total']}")
         print(f"❌ Failed: {job['failed']}/{job['total']}")
         print(f"{'='*60}\n")
         

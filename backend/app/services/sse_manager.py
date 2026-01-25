@@ -112,6 +112,7 @@ class SSEManager:
 
     async def _redis_subscriber(self):
         """Background task to receive Redis pub/sub messages and broadcast to SSE connections"""
+        logger.info("SSE Manager: Redis subscriber started, listening for events...")
         try:
             async for message in self._pubsub.listen():
                 if message["type"] == "message":
@@ -120,6 +121,10 @@ class SSEManager:
                         job_id = event_data.get("job_id")
                         event_type = event_data.get("event_type")
                         data = event_data.get("data", {})
+
+                        logger.debug("SSE Manager: Received Redis message", 
+                                   job_id=job_id, event_type=event_type)
+                        print(f"📥 [SSE] Received Redis event: {event_type} for job {job_id}")
 
                         if job_id and event_type:
                             # Broadcast to local connections
@@ -136,7 +141,12 @@ class SSEManager:
         async with self._lock:
             if job_id in self._connections:
                 connections = list(self._connections[job_id])
+                print(f"📤 [SSE] Broadcasting {event_type} to {len(connections)} connections for job {job_id}")
             else:
+                print(f"⚠️ [SSE] No connections for job {job_id}, event {event_type} dropped")
+                logger.debug("SSE Manager: No connections for job, event dropped", 
+                           job_id=job_id, event_type=event_type,
+                           registered_jobs=list(self._connections.keys()))
                 return
 
         for connection in connections:

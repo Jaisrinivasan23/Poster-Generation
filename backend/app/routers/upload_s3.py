@@ -136,7 +136,7 @@ async def save_local(file: UploadFile = File(...)):
 
 # ============ Admin Template Image Management ============
 
-@router.post("/api/template-images/upload")
+@router.post("/template-images/upload")
 async def upload_template_image(
     file: UploadFile = File(...),
     name: str = Form(...),
@@ -168,7 +168,8 @@ async def upload_template_image(
             RETURNING id, name, url, category, created_at
         """
         
-        result = await database_service.fetchrow(query, name, url, category, uploaded_by)
+        async with database_service.connection() as conn:
+            result = await conn.fetchrow(query, name, url, category, uploaded_by)
         
         if not result:
             raise HTTPException(status_code=500, detail="Failed to save template to database")
@@ -191,7 +192,7 @@ async def upload_template_image(
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
-@router.get("/api/template-images")
+@router.get("/template-images")
 async def get_template_images():
     """Get all active template images"""
     try:
@@ -202,7 +203,8 @@ async def get_template_images():
             ORDER BY created_at DESC
         """
         
-        rows = await database_service.fetch(query)
+        async with database_service.connection() as conn:
+            rows = await conn.fetch(query)
         
         templates = [
             {
@@ -222,7 +224,7 @@ async def get_template_images():
         return {"templates": []}
 
 
-@router.delete("/api/template-images/{template_id}")
+@router.delete("/template-images/{template_id}")
 async def delete_template_image(template_id: str):
     """Delete a template image (soft delete)"""
     try:
@@ -233,7 +235,8 @@ async def delete_template_image(template_id: str):
             RETURNING id
         """
         
-        result = await database_service.fetchrow(query, template_id)
+        async with database_service.connection() as conn:
+            result = await conn.fetchrow(query, template_id)
         
         if not result:
             raise HTTPException(status_code=404, detail="Template not found")
@@ -249,7 +252,7 @@ async def delete_template_image(template_id: str):
 
 # ============ Admin Custom Font Management ============
 
-@router.post("/api/custom-fonts/upload")
+@router.post("/custom-fonts/upload")
 async def upload_custom_font(
     file: UploadFile = File(...),
     font_name: str = Form(...),
@@ -289,9 +292,10 @@ async def upload_custom_font(
             RETURNING id, font_name, font_family, file_url, file_format, created_at
         """
         
-        result = await database_service.fetchrow(
-            query, font_name, font_family, url, file_format, uploaded_by
-        )
+        async with database_service.connection() as conn:
+            result = await conn.fetchrow(
+                query, font_name, font_family, url, file_format, uploaded_by
+            )
         
         if not result:
             raise HTTPException(status_code=500, detail="Failed to save font to database")
@@ -315,7 +319,7 @@ async def upload_custom_font(
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
-@router.get("/api/custom-fonts")
+@router.get("/custom-fonts")
 async def get_custom_fonts():
     """Get all active custom fonts"""
     try:
@@ -326,7 +330,8 @@ async def get_custom_fonts():
             ORDER BY font_family ASC
         """
         
-        rows = await database_service.fetch(query)
+        async with database_service.connection() as conn:
+            rows = await conn.fetch(query)
         
         fonts = [
             {
@@ -347,7 +352,7 @@ async def get_custom_fonts():
         return {"fonts": []}
 
 
-@router.delete("/api/custom-fonts/{font_id}")
+@router.delete("/custom-fonts/{font_id}")
 async def delete_custom_font(font_id: str):
     """Delete a custom font (soft delete)"""
     try:
@@ -358,7 +363,8 @@ async def delete_custom_font(font_id: str):
             RETURNING id
         """
         
-        result = await database_service.fetchrow(query, font_id)
+        async with database_service.connection() as conn:
+            result = await conn.fetchrow(query, font_id)
         
         if not result:
             raise HTTPException(status_code=404, detail="Font not found")

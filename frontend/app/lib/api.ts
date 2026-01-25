@@ -432,16 +432,47 @@ export async function listTemplates(section?: string): Promise<{
 }
 
 /**
- * Generate poster from template (async)
- * @param params - Generation parameters
- * @returns Job ID and status endpoint
+ * Generate poster from template response type
  */
-export async function generateFromTemplate(params: GenerateFromTemplateParams): Promise<{
+export interface GenerateFromTemplateResponse {
   success: boolean;
   job_id: string;
+  status: string;
+  template_version: number;
+  template_name: string;
+  sse_endpoint: string;
+  poll_endpoint: string;
   message: string;
-  status_endpoint: string;
-}> {
+}
+
+/**
+ * SSE event types for template generation
+ */
+export interface TemplateSSEProgressEvent {
+  job_id: string;
+  processed: number;
+  total: number;
+  success_count: number;
+  failure_count: number;
+  percent_complete: number;
+  phase: string;
+}
+
+export interface TemplateSSECompletedEvent {
+  job_id: string;
+  success: boolean;
+  url?: string;
+  generation_time_ms?: number;
+  template_version?: number;
+  error?: string;
+}
+
+/**
+ * Generate poster from template (async with SSE support)
+ * @param params - Generation parameters
+ * @returns Job ID and SSE endpoint for real-time progress
+ */
+export async function generateFromTemplate(params: GenerateFromTemplateParams): Promise<GenerateFromTemplateResponse> {
   const response = await apiFetch('/api/templates/generate', {
     method: 'POST',
     headers: {
@@ -456,6 +487,167 @@ export async function generateFromTemplate(params: GenerateFromTemplateParams): 
   }
 
   return response.json();
+}
+
+/**
+ * Connect to template generation SSE stream and wait for completion
+ * @param sseEndpoint - SSE endpoint from generateFromTemplate response
+ * @param onProgress - Callback for progress updates
+ * @returns Promise that resolves with the completed poster URL
+ */
+export function subscribeToTemplateGeneration(
+  sseEndpoint: string,
+  onProgress?: (event: TemplateSSEProgressEvent) => void,
+  onLog?: (message: string, level: string) => void
+): Promise<TemplateSSECompletedEvent> {
+  return new Promise((resolve, reject) => {
+    const url = `${BACKEND_API_URL}${sseEndpoint}`;
+    console.log('🔌 Connecting to template SSE:', url);
+    
+    const eventSource = new EventSource(url);
+    let resolved = false;
+    
+    // Connection timeout
+    const timeout = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        eventSource.close();
+        reject(new Error('SSE connection timeout'));
+      }
+    }, 120000); // 2 minute timeout
+    
+    eventSource.onopen = () => {
+      console.log('✅ Template SSE connected');
+      onLog?.('Connected to generation stream', 'INFO');
+    };
+    
+    eventSource.addEventListener('status', (e) => {
+      const data = JSON.parse(e.data);
+      console.log(' Status:', data);
+      onProgress?.({
+        job_id: data.job_id,
+        processed: 0,
+        total: 1,
+        success_count: 0,
+        failure_count: 0,
+        percent_complete: 0,
+        phase: data.status || 'starting'
+      });
+    });
+    
+    eventSource.addEventListener('progress', (e) => {
+      const data = JSON.parse(e.data);
+      console.log('📈 Progress:', data);
+      onProgress?.(data);
+    });
+    
+    eventSource.addEventListener('log', (e) => {
+      const data = JSON.parse(e.data);
+      console.log(`📝 [${data.level}] ${data.message}`);
+      onLog?.(data.message, data.level);
+    });
+    
+    eventSource.addEventListener('poster_completed', (e) => {
+      const data: TemplateSSECompletedEvent = JSON.parse(e.data);
+      console.log('🖼️ Poster completed:', data);
+      clearTimeout(timeout);
+      if (!resolved) {
+        resolved = true;
+        eventSource.close();
+        if (data.success && data.url) {
+          resolve(data);
+        } else {
+          reject(new Error(data.error || 'Generation failed'));
+        }
+      }
+    });
+    
+    eventSource.addEventListener('job_completed', (e) => {
+      const data = JSON.parse(e.data);
+      console.log('✅ Job completed:', data);
+      clearTimeout(timeout);
+      if (!resolved) {
+        resolved = true;
+        eventSource.close();
+        resolve(data);
+      }
+    });
+    
+    eventSource.addEventListener('job_failed', (e) => {
+      const data = JSON.parse(e.data);
+      console.error('❌ Job failed:', data);
+      clearTimeout(timeout);
+      if (!resolved) {
+        resolved = true;
+        eventSource.close();
+        reject(new Error(data.error || 'Generation failed'));
+      }
+    });
+    
+    eventSource.addEventListener('heartbeat', () => {
+      console.log('💓 Heartbeat');
+    });
+    
+    eventSource.onerror = (error) => {
+      console.error('❌ SSE error:', error);
+      clearTimeout(timeout);
+      if (!resolved) {
+        // Check if it's a normal close or an error
+        if (eventSource.readyState === EventSource.CLOSED) {
+          // Connection closed normally, might have missed completion event
+          // Don't reject immediately, let the timeout handle it
+        } else {
+          resolved = true;
+          eventSource.close();
+          reject(new Error('SSE connection error'));
+        }
+      }
+    };
+  });
+}
+
+/**
+ * Generate poster from template with SSE progress tracking (convenience function)
+ * @param params - Generation parameters
+ * @param onProgress - Progress callback
+ * @returns Promise with the final poster URL
+ */
+export async function generateFromTemplateWithProgress(
+  params: GenerateFromTemplateParams,
+  onProgress?: (percent: number, phase: string) => void,
+  onLog?: (message: string, level: string) => void
+): Promise<{ url: string; generation_time_ms: number; template_version: number }> {
+  // Start generation and get SSE endpoint
+  const response = await generateFromTemplate(params);
+  
+  if (!response.success || !response.sse_endpoint) {
+    throw new Error('Failed to start generation');
+  }
+  
+  // Send initial progress
+  onProgress?.(0, 'starting');
+  onLog?.('Generation started', 'INFO');
+  
+  // Connect to SSE and wait for completion
+  const result = await subscribeToTemplateGeneration(
+    response.sse_endpoint,
+    (event) => {
+      onProgress?.(event.percent_complete, event.phase);
+    },
+    onLog
+  );
+  
+  if (!result.success || !result.url) {
+    throw new Error(result.error || 'Generation failed');
+  }
+  
+  onProgress?.(100, 'completed');
+  
+  return {
+    url: result.url,
+    generation_time_ms: result.generation_time_ms || 0,
+    template_version: result.template_version || response.template_version
+  };
 }
 
 /**

@@ -76,7 +76,7 @@ def test_generation():
         if response.status_code == 200:
             result = response.json()
             print(f"\n✅ SUCCESS!")
-            print(f"\n📊 Result:")
+            print(f"\n Result:")
             print(json.dumps(result, indent=2))
             
             if 'url' in result:

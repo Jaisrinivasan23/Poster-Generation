@@ -29,6 +29,10 @@ export default function TemplatesPage() {
   const [uploadSuccess, setUploadSuccess] = useState<string | null>(null);
   const [uploadPreviewValues, setUploadPreviewValues] = useState<Record<string, string>>({});
 
+  // Edit mode state
+  const [isEditMode, setIsEditMode] = useState(false);
+  const [editTemplateId, setEditTemplateId] = useState<string | null>(null);
+
   // Fetch all templates on mount
   useEffect(() => {
     fetchTemplates();
@@ -71,6 +75,32 @@ export default function TemplatesPage() {
     setPlaceholderValues(initialValues);
   };
 
+  const startEditTemplate = (template: Template) => {
+    setIsEditMode(true);
+    setEditTemplateId(template.id);
+    setUploadSection(template.section);
+    setUploadName(template.name);
+    setUploadHtml(template.html_content || '');
+    setUploadCss(template.css_content || '');
+    setUploadSetActive(template.is_active);
+    setShowUploadForm(true);
+    setError(null);
+    setUploadSuccess(null);
+  };
+
+  const cancelEdit = () => {
+    setIsEditMode(false);
+    setEditTemplateId(null);
+    setUploadSection('');
+    setUploadName('');
+    setUploadHtml('');
+    setUploadCss('');
+    setUploadSetActive(true);
+    setShowUploadForm(false);
+    setError(null);
+    setUploadSuccess(null);
+  };
+
   const handlePlaceholderChange = (name: string, value: string) => {
     setPlaceholderValues(prev => ({
       ...prev,
@@ -97,7 +127,9 @@ export default function TemplatesPage() {
         set_as_active: uploadSetActive
       });
 
-      setUploadSuccess(`Template uploaded successfully! Version ${result.version}`);
+      setUploadSuccess(isEditMode 
+        ? `Template updated successfully! New version: ${result.version}` 
+        : `Template uploaded successfully! Version ${result.version}`);
 
       // Clear form
       setUploadSection('');
@@ -105,6 +137,8 @@ export default function TemplatesPage() {
       setUploadHtml('');
       setUploadCss('');
       setUploadSetActive(true);
+      setIsEditMode(false);
+      setEditTemplateId(null);
 
       // Refresh templates
       fetchTemplates();
@@ -128,8 +162,8 @@ export default function TemplatesPage() {
 
     // Replace all placeholders with values
     Object.keys(placeholderValues).forEach(key => {
-      const value = placeholderValues[key] || `{{${key}}}`;
-      html = html.replace(new RegExp(`{{${key}}}`, 'g'), value);
+      const value = placeholderValues[key] || `{${key}}`;
+      html = html.replace(new RegExp(`\\{${key}\\}`, 'g'), value);
     });
 
     // Wrap with CSS if available
@@ -145,7 +179,7 @@ export default function TemplatesPage() {
 
   // Extract placeholders from upload HTML
   const extractPlaceholders = (html: string): string[] => {
-    const regex = /\{\{([^}]+)\}\}/g;
+    const regex = /\{([a-zA-Z_][a-zA-Z0-9_.]*)\}/g;
     const placeholders: string[] = [];
     let match;
 
@@ -167,8 +201,8 @@ export default function TemplatesPage() {
 
     // Replace all placeholders with preview values
     Object.keys(uploadPreviewValues).forEach(key => {
-      const value = uploadPreviewValues[key] || `{{${key}}}`;
-      html = html.replace(new RegExp(`{{${key}}}`, 'g'), value);
+      const value = uploadPreviewValues[key] || `{${key}}`;
+      html = html.replace(new RegExp(`\\{${key}\\}`, 'g'), value);
     });
 
     // Wrap with CSS if available
@@ -239,7 +273,13 @@ export default function TemplatesPage() {
               </h1>
             </div>
             <button
-              onClick={() => setShowUploadForm(!showUploadForm)}
+              onClick={() => {
+                if (showUploadForm && isEditMode) {
+                  cancelEdit();
+                } else {
+                  setShowUploadForm(!showUploadForm);
+                }
+              }}
               className="px-4 py-2 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white rounded-lg text-sm font-medium transition-all flex items-center gap-2 shadow-sm"
             >
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -256,7 +296,22 @@ export default function TemplatesPage() {
         {/* Upload Form */}
         {showUploadForm && (
           <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 mb-6">
-            <h2 className="text-lg font-semibold text-slate-900 mb-4">Upload New Template</h2>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold text-slate-900">
+                {isEditMode ? 'Edit Template' : 'Upload New Template'}
+              </h2>
+              {isEditMode && (
+                <button
+                  onClick={cancelEdit}
+                  className="text-sm text-slate-500 hover:text-slate-700 flex items-center gap-1"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                  Cancel Edit
+                </button>
+              )}
+            </div>
 
             {/* Upload Form Grid: Left = Form, Right = Preview */}
             <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
@@ -296,12 +351,12 @@ export default function TemplatesPage() {
                   <textarea
                     value={uploadHtml}
                     onChange={(e) => setUploadHtml(e.target.value)}
-                    placeholder="<div>{{consumer_name}}: {{consumer_message}}</div>"
+                    placeholder="<div>{consumer_name}: {consumer_message}</div>"
                     rows={8}
                     className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent font-mono text-sm"
                   />
                   <p className="text-xs text-slate-500 mt-1">
-                    Use {`{{placeholder_name}}`} syntax for dynamic content
+                    Use {`{placeholder_name}`} syntax for dynamic content
                   </p>
                 </div>
 
@@ -352,14 +407,18 @@ export default function TemplatesPage() {
                   {isUploading ? (
                     <>
                       <div className="animate-spin w-5 h-5 border-3 border-white border-t-transparent rounded-full"></div>
-                      Uploading...
+                      {isEditMode ? 'Saving...' : 'Uploading...'}
                     </>
                   ) : (
                     <>
                       <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                        {isEditMode ? (
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                        ) : (
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                        )}
                       </svg>
-                      Upload Template
+                      {isEditMode ? 'Save Changes' : 'Upload Template'}
                     </>
                   )}
                 </button>
@@ -586,7 +645,18 @@ export default function TemplatesPage() {
 
                   {/* Template Info */}
                   <div className="mt-6 pt-6 border-t border-slate-200">
-                    <h3 className="text-sm font-medium text-slate-700 mb-2">Template Info</h3>
+                    <div className="flex items-center justify-between mb-2">
+                      <h3 className="text-sm font-medium text-slate-700">Template Info</h3>
+                      <button
+                        onClick={() => startEditTemplate(selectedTemplate)}
+                        className="text-xs px-2 py-1 bg-purple-100 text-purple-700 hover:bg-purple-200 rounded flex items-center gap-1 transition"
+                      >
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                        </svg>
+                        Edit
+                      </button>
+                    </div>
                     <div className="space-y-1 text-sm text-slate-600">
                       <p><span className="font-medium">Section:</span> {selectedTemplate.section}</p>
                       <p><span className="font-medium">Version:</span> {selectedTemplate.version}</p>

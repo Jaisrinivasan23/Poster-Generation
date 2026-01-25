@@ -143,7 +143,7 @@ export default function BulkProgressTracker({
             <div className={`text-2xl font-bold ${successRate >= 90 ? 'text-green-600' : 'text-yellow-600'}`}>
               {successRate}%
             </div>
-            <div className="text-xs text-gray-500 mt-1">📊 Success Rate</div>
+            <div className="text-xs text-gray-500 mt-1"> Success Rate</div>
           </div>
         )}
       </div>

@@ -46,7 +46,7 @@ async def generate_bulk(request: GenerateBulkRequest):
     try:
         print(f"\n{'='*60}")
         print(f"🎨 [GENERATE-BULK] Received bulk generation request")
-        print(f"📊 [GENERATE-BULK] Mode: {request.bulkMethod}")
+        print(f" [GENERATE-BULK] Mode: {request.bulkMethod}")
         print(f"{'='*60}\n")
         
         # CSV MODE: Convert CSV data to user identifiers for RedPanda processing

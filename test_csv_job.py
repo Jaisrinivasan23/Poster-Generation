@@ -29,7 +29,7 @@ response = requests.post(
 if response.status_code == 200:
     data = response.json()
     print(f"✅ Job created: {data['jobId']}")
-    print(f"📊 Total items: {data['totalItems']}")
+    print(f" Total items: {data['totalItems']}")
     print(f"🔗 SSE endpoint: {data['sseEndpoint']}")
 
     job_id = data['jobId']

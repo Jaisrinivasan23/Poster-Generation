@@ -82,8 +82,60 @@ class HTMLToImageConverter:
             # Set default timeout for this page
             page.set_default_timeout(timeout)
 
+            # Wrap HTML to ensure it fills the viewport
+            # This handles templates that have their own body/html with different dimensions
+            wrapped_html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width={width}, height={height}">
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        html, body {{
+            width: {width}px;
+            height: {height}px;
+            overflow: hidden;
+            background: transparent;
+        }}
+        body {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        /* Scale content to fit viewport if it has fixed dimensions */
+        body > * {{
+            max-width: 100%;
+            max-height: 100%;
+        }}
+    </style>
+</head>
+<body>
+{html}
+</body>
+</html>"""
+
+            # Check if html already has DOCTYPE or html tag - if so, use it directly
+            html_lower = html.strip().lower()
+            if html_lower.startswith('<!doctype') or html_lower.startswith('<html'):
+                # Template already has full HTML structure - inject scaling CSS instead
+                wrapped_html = html
+                # Inject CSS to force viewport size
+                if '<head>' in html.lower():
+                    inject_css = f"""<style>
+                        html, body {{ 
+                            width: {width}px !important; 
+                            height: {height}px !important; 
+                            margin: 0 !important; 
+                            padding: 0 !important;
+                            overflow: hidden !important;
+                        }}
+                    </style>"""
+                    # Insert after <head>
+                    head_end_idx = html.lower().find('<head>') + 6
+                    wrapped_html = html[:head_end_idx] + inject_css + html[head_end_idx:]
+
             # Set content and wait for network to be idle (ensures all resources loaded)
-            await page.set_content(html, wait_until='networkidle', timeout=timeout)
+            await page.set_content(wrapped_html, wait_until='networkidle', timeout=timeout)
 
             # Wait for fonts to be ready (important for first batch)
             await page.evaluate('document.fonts.ready')
@@ -104,7 +156,7 @@ class HTMLToImageConverter:
                 timeout=timeout
             )
 
-            print(f"[HTML2PNG] Screenshot captured: {len(screenshot_bytes)} bytes")
+            print(f"[HTML2PNG] Screenshot captured: {len(screenshot_bytes)} bytes ({width}x{height})")
 
             return screenshot_bytes
 

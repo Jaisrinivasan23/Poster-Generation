@@ -111,6 +111,8 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
 
   // Generation state
   const [isLoading, setIsLoading] = useState(false);
+  const [generationProgress, setGenerationProgress] = useState<{ phase: string; progress: number } | null>(null);
+  const [generationLogs, setGenerationLogs] = useState<string[]>([]);
   const [isCompletingCarousel, setIsCompletingCarousel] = useState(false);
   const [posters, setPosters] = useState<GeneratedPoster[]>([]);
   const [carousels, setCarousels] = useState<GeneratedPoster[][]>([]); // For carousel: array of variants
@@ -153,7 +155,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
 
   // SSE hook for CSV bulk generation
   const handleCsvProgress = useCallback((event: SSEProgressEvent) => {
-    console.log('📊 [CSV SSE] Progress:', event);
+    console.log(' [CSV SSE] Progress:', event);
     setCsvProgress({
       processed: event.processed,
       total: event.total,
@@ -269,7 +271,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
 
         // Set the parsed data
         setCsvData(results.data as any[]);
-        console.log('📊 [CSV] Parsed CSV with Papa Parse:', {
+        console.log(' [CSV] Parsed CSV with Papa Parse:', {
           headers,
           rowCount: results.data.length,
           sample: results.data[0],
@@ -594,7 +596,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
     const topmateLogo = getTopmateLogo();
 
     try {
-      // SINGLE MODE: Generate with real profile
+      // SINGLE MODE: Generate with real profile using async SSE
       if (flowMode === 'single') {
         const config: PosterConfig = {
           topmateUsername: topmateUsername.trim(),
@@ -614,6 +616,11 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
           selectedFields: selectedDataFields,
         } : undefined;
 
+        // Reset progress state
+        setGenerationProgress({ phase: 'starting', progress: 0 });
+        setGenerationLogs(['Starting generation...']);
+
+        // Step 1: Call API to start generation (returns immediately with SSE endpoint)
         const response = await apiFetch('/api/generate-poster', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -630,35 +637,149 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
         const data = await response.json();
 
         if (!response.ok) {
-          throw new Error(data.error || 'Generation failed');
+          throw new Error(data.error || data.detail || 'Generation failed');
         }
 
-        if (data.mode === 'carousel') {
-          // Carousel mode: data.carousels is array of variants, each containing slides
-          setCarousels(data.carousels);
-          setSelectedVariant(0);
-          setSelectedSlide(0);
-          setPosters([]); // Clear single mode posters
-          // Check if this is preview-only (first slides only)
-          setIsCarouselPreview(data.previewOnly || false);
-          setTotalSlides(data.totalSlides || slideCount);
-          // Store profile for completion API
-          if (data.carousels[0]?.[0]?.topmateProfile) {
-            setCarouselProfile(data.carousels[0][0].topmateProfile);
-          }
+        // Check if response has SSE endpoint (new async flow)
+        if (data.sse_endpoint) {
+          console.log('🔌 Connecting to SSE:', data.sse_endpoint);
+          setGenerationLogs(prev => [...prev, 'Connecting to generation stream...']);
+          
+          // Connect to SSE for real-time updates
+          const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_API_URL || 'http://localhost:8000';
+          const sseUrl = `${BACKEND_URL}${data.sse_endpoint}`;
+          const eventSource = new EventSource(sseUrl);
+          
+          // Handle SSE events
+          await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              eventSource.close();
+              reject(new Error('Generation timeout'));
+            }, 180000); // 3 minute timeout
+            
+            eventSource.onopen = () => {
+              console.log('✅ SSE connected for poster generation');
+              setGenerationLogs(prev => [...prev, 'Connected! Generating variants...']);
+            };
+            
+            eventSource.addEventListener('progress', (e) => {
+              const progressData = JSON.parse(e.data);
+              console.log('📈 Progress:', progressData);
+              const phaseLabels: Record<string, string> = {
+                'starting': 'Starting...',
+                'queued': 'Queued',
+                'fetching_profile': 'Fetching profile...',
+                'analyzing_prompt': 'Analyzing prompt...',
+                'generating': 'Generating designs...',
+              };
+              setGenerationProgress({
+                phase: phaseLabels[progressData.phase] || progressData.phase,
+                progress: Math.round((progressData.processed / progressData.total) * 100)
+              });
+            });
+            
+            eventSource.addEventListener('log', (e) => {
+              const logData = JSON.parse(e.data);
+              console.log(`📝 [${logData.level}] ${logData.message}`);
+              if (logData.level !== 'DEBUG') {
+                setGenerationLogs(prev => [...prev.slice(-9), logData.message]);
+              }
+            });
+            
+            eventSource.addEventListener('job_completed', (e) => {
+              const result = JSON.parse(e.data);
+              console.log('✅ Generation completed:', result);
+              clearTimeout(timeout);
+              eventSource.close();
+              
+              // Set the result
+              if (result.mode === 'carousel' && result.carousels) {
+                setCarousels(result.carousels);
+                setSelectedVariant(0);
+                setSelectedSlide(0);
+                setPosters([]);
+                setIsCarouselPreview(result.previewOnly || false);
+                setTotalSlides(result.totalSlides || slideCount);
+                if (result.carousels[0]?.[0]?.topmateProfile) {
+                  setCarouselProfile(result.carousels[0][0].topmateProfile);
+                }
+              } else if (result.posters) {
+                setPosters(result.posters);
+                setSelectedIndex(0);
+                setCarousels([]);
+                setIsCarouselPreview(false);
+              }
+              setResultMode(result.mode || 'single');
+              setGenerationProgress({ phase: 'Complete!', progress: 100 });
+              resolve();
+            });
+            
+            eventSource.addEventListener('job_failed', (e) => {
+              const errorData = JSON.parse(e.data);
+              console.error('❌ Generation failed:', errorData);
+              clearTimeout(timeout);
+              eventSource.close();
+              reject(new Error(errorData.error || 'Generation failed'));
+            });
+            
+            eventSource.onerror = (error) => {
+              console.error('❌ SSE error:', error);
+              // Don't reject immediately - might be normal close
+              if (eventSource.readyState === EventSource.CLOSED) {
+                // Check if we got results via polling
+                setTimeout(async () => {
+                  try {
+                    const resultResponse = await apiFetch(`/api/generate-poster/${data.job_id}/result`, {
+                      method: 'GET',
+                    });
+                    if (resultResponse.ok) {
+                      const result = await resultResponse.json();
+                      if (result.posters) {
+                        setPosters(result.posters);
+                        setSelectedIndex(0);
+                        setCarousels([]);
+                        setIsCarouselPreview(false);
+                        setResultMode('single');
+                        setGenerationProgress({ phase: 'Complete!', progress: 100 });
+                        resolve();
+                        return;
+                      }
+                    }
+                  } catch {}
+                  clearTimeout(timeout);
+                  reject(new Error('Connection lost'));
+                }, 1000);
+              }
+            };
+          });
         } else {
-          // Single mode: data.posters is array of variant posters
-          setPosters(data.posters);
-          setSelectedIndex(0);
-          setCarousels([]); // Clear carousel data
-          setIsCarouselPreview(false);
+          // Legacy sync response (fallback)
+          if (data.mode === 'carousel') {
+            setCarousels(data.carousels);
+            setSelectedVariant(0);
+            setSelectedSlide(0);
+            setPosters([]);
+            setIsCarouselPreview(data.previewOnly || false);
+            setTotalSlides(data.totalSlides || slideCount);
+            if (data.carousels[0]?.[0]?.topmateProfile) {
+              setCarouselProfile(data.carousels[0][0].topmateProfile);
+            }
+          } else {
+            setPosters(data.posters);
+            setSelectedIndex(0);
+            setCarousels([]);
+            setIsCarouselPreview(false);
+          }
+          setResultMode(data.mode || 'single');
         }
-        setResultMode(data.mode || 'single');
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to generate poster');
+      setGenerationProgress(null);
     } finally {
       setIsLoading(false);
+      // Clear progress after a short delay
+      setTimeout(() => setGenerationProgress(null), 2000);
     }
   };
 
@@ -1283,7 +1404,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                       </svg>
                     </div>
                     <div className="ml-3">
-                      <h3 className="text-sm font-medium text-blue-800">📊 CSV Bulk Generation Flow</h3>
+                      <h3 className="text-sm font-medium text-blue-800"> CSV Bulk Generation Flow</h3>
                       <p className="mt-1 text-sm text-blue-700">
                         <strong>Step 1:</strong> Upload CSV file with your data (must include "username" column).<br />
                         <strong>Step 2:</strong> Create HTML template using CSV column names as placeholders.<br />
@@ -1707,7 +1828,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
     <img class="profile-img" src="{profile_pic}" alt="Profile">
     <div class="name">{name}</div>
     <div>{email}</div>
-    <div>📊 {total_sales} Sales</div>
+    <div> {total_sales} Sales</div>
   </div>
 </body>
 </html>`}
@@ -2210,7 +2331,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
     <img class="profile-img" src="{profile_pic}" alt="Profile">
     <div class="name">{display_name}</div>
     <div class="bio">{bio}</div>
-    <div class="stats">📊 {total_bookings} Bookings | ⭐ {average_rating}/5</div>
+    <div class="stats"> {total_bookings} Bookings | ⭐ {average_rating}/5</div>
   </div>
 </body>
 </html>`}
@@ -2700,6 +2821,37 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                     : 'Generate Posters'
               )}
             </button>
+
+            {/* Progress Bar - Shows during AI generation with SSE */}
+            {isLoading && generationProgress && generationProgress.phase && (
+              <div className="mt-4 p-4 bg-gradient-to-r from-purple-50 to-pink-50 border border-purple-200 rounded-xl">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-sm font-medium text-purple-700">
+                    {generationProgress.phase}
+                  </span>
+                  <span className="text-sm font-bold text-purple-600">
+                    {generationProgress.progress}%
+                  </span>
+                </div>
+                <div className="w-full bg-purple-100 rounded-full h-3 overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-purple-500 to-pink-500 rounded-full transition-all duration-300 ease-out"
+                    style={{ width: `${generationProgress.progress}%` }}
+                  />
+                </div>
+                {/* Show recent logs */}
+                {generationLogs && generationLogs.length > 0 && (
+                  <div className="mt-3 max-h-20 overflow-y-auto text-xs text-slate-600 space-y-1">
+                    {generationLogs.slice(-3).map((log, idx) => (
+                      <div key={idx} className="flex items-start gap-2">
+                        <span className="text-purple-400">→</span>
+                        <span>{log}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
             {error && (
               <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">

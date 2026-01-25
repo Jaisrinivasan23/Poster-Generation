@@ -180,7 +180,7 @@ async def call_openrouter_for_image(
             if image_item.get("image_url", {}).get("url"):
                 image_url = image_item["image_url"]["url"]
                 print("✅ [TEMPLATE] Successfully extracted image from message.images")
-                print(f"📊 [TEMPLATE] Image URL length: {len(image_url)} chars")
+                print(f" [TEMPLATE] Image URL length: {len(image_url)} chars")
                 return {"imageUrl": image_url}
         
         # Fallback: Gemini returns image data in message.parts[].inline_data
@@ -191,7 +191,7 @@ async def call_openrouter_for_image(
                     base64_data = part["inline_data"]["data"]
                     data_url = f"data:{mime_type};base64,{base64_data}"
                     print("✅ [TEMPLATE] Successfully extracted image from parts.inline_data")
-                    print(f"📊 [TEMPLATE] Image size: {len(base64_data)} chars, type: {mime_type}")
+                    print(f" [TEMPLATE] Image size: {len(base64_data)} chars, type: {mime_type}")
                     return {"imageUrl": data_url}
         
         # Fallback: check message.content

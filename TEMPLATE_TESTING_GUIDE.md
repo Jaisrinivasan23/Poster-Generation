@@ -99,7 +99,7 @@ The debug version:
 ```
 ✅ SUCCESS!
 
-📊 Result:
+ Result:
 {
   "url": "https://s3.amazonaws.com/bucket/templates/testimonial/3_1234567890.png",
   "template_version_used": 1,
@@ -153,7 +153,7 @@ python upload_sample_template.py
 
 ---
 
-## 📊 Backend Logs to Monitor
+##  Backend Logs to Monitor
 
 When testing, watch for these log messages:
 

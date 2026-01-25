@@ -52,7 +52,7 @@ def main():
         print("Some migrations failed. Check errors above.")
 
     # Verify tables
-    print("\n📊 Verifying new tables...")
+    print("\n Verifying new tables...")
     verify_cmd = [
         "docker", "exec", "-i", "poster-postgres",
         "psql", "-U", "postgres", "-d", "poster_generation",

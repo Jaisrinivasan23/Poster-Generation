@@ -28,7 +28,7 @@
 
 ---
 
-## 📊 Architecture
+##  Architecture
 
 ```
 Django Backend
@@ -383,7 +383,7 @@ def create_testimonial(request):
 
 ### Performance:
 - ⚡ ~9 seconds per poster
-- 📊 All operations logged to database
+-  All operations logged to database
 - 🔄 Async/non-blocking
 - 📈 Ready for parallel batch processing
 

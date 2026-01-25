@@ -1,15 +1,17 @@
 """
 Generate Poster Router
 POST /api/generate-poster - Generate poster with AI (single or carousel)
+GET /api/generate-poster/{job_id}/stream - SSE stream for real-time progress
 
 Uses 3-strategy approach:
 - Strategy A: Reference-Faithful (match reference exactly)
 - Strategy B: Reference-Remix (creative interpretation)
 - Strategy C: AI Creative Director (content-aware design)
 
-Migrated from Next.js TypeScript - exact same logic and prompts.
+Now uses TaskIQ for async processing with SSE progress updates.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 from typing import Optional, List, Dict, Any
 from app.models.poster import GeneratePosterRequest, GeneratePosterResponse, GeneratedPoster, PosterDimensions
 from app.services.topmate_client import fetch_topmate_profile
@@ -27,9 +29,20 @@ from app.services.prompts import (
     build_creative_directive,
     process_mcp_data
 )
+from app.services.sse_manager import sse_manager
+from app.tasks.poster_tasks import (
+    process_ai_poster_generation_task,
+    get_ai_poster_job,
+    set_ai_poster_job,
+    update_ai_poster_job
+)
 from datetime import datetime
 import json
 import asyncio
+import uuid
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
@@ -45,76 +58,22 @@ POSTER_SIZE_DIMENSIONS = {
 }
 
 
-async def get_creative_direction(
-    model: str,
-    prompt: str
-) -> dict | None:
-    """
-    Get creative direction from AI Creative Director
-
-    Args:
-        model: Model ID
-        prompt: User's prompt
-
-    Returns:
-        Creative direction JSON or None if failed
-    """
-    try:
-        print("🎨 Getting creative direction from AI...")
-
-        user_prompt = f"""Analyze this poster/carousel request and provide creative direction:
-
-"{prompt}"
-
-Return ONLY a valid JSON object with your creative direction. No explanation, just JSON."""
-
-        response = await call_openrouter(
-            model=model,
-            system_prompt=CREATIVE_DIRECTOR_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            reference_image=None,
-            max_tokens=2000
-        )
-
-        # Parse JSON from response
-        # Try to find JSON object in response
-        start_idx = response.find('{')
-        end_idx = response.rfind('}') + 1
-
-        if start_idx != -1 and end_idx > start_idx:
-            json_str = response[start_idx:end_idx]
-            direction = json.loads(json_str)
-            print(f"✅ Creative direction received: {direction.get('contentType', 'unknown')}")
-            return direction
-
-        print("⚠️ Could not parse creative direction JSON")
-        return None
-
-    except Exception as e:
-        print(f"❌ Creative direction failed: {e}")
-        return None
-
-
-@router.post("/generate-poster", response_model=GeneratePosterResponse)
+@router.post("/generate-poster")
 async def generate_poster(request: GeneratePosterRequest):
     """
-    Generate poster with AI using 3-strategy approach
+    Generate poster with AI using 3-strategy approach (async with SSE)
+
+    Returns immediately with job_id and SSE endpoint for real-time progress.
+    Connect to SSE endpoint to receive progress updates and final result.
 
     Strategies:
     - A (reference-faithful): Match reference image exactly
     - B (reference-remix): Creative interpretation of reference
     - C (ai-creative-director): Content-aware design (no reference needed)
-
-    Supports:
-    - Single poster generation (3 variants)
-    - Carousel generation (preview first slides only)
-    - HTML generation mode
-    - Reference image support
     """
     try:
+        # Validate profile exists first (fast check before queuing)
         config = request.config
-
-        # Fetch Topmate profile
         try:
             profile = await fetch_topmate_profile(config.topmateUsername)
         except Exception as e:
@@ -122,153 +81,160 @@ async def generate_poster(request: GeneratePosterRequest):
                 status_code=404,
                 detail=f"Failed to fetch Topmate profile for '{config.topmateUsername}'. Please check the username."
             )
-
-        # Get dimensions
-        if config.size == "custom" and config.customDimensions:
-            dimensions = config.customDimensions
-        else:
-            dim = POSTER_SIZE_DIMENSIONS.get(
-                config.size,
-                POSTER_SIZE_DIMENSIONS["instagram-square"]
-            )
-            dimensions = PosterDimensions(width=dim["width"], height=dim["height"])
-
-        # Select model (force flash for expert mode)
-        if request.userMode == "expert":
-            model_id = "google/gemini-3-flash-preview"
-            print(f"🎨 Expert mode: Using {model_id}")
-        else:
-            model_id = (
-                "google/gemini-3-flash-preview"
-                if request.model == "flash"
-                else "google/gemini-3-pro-preview"
-            )
-            print(f"🎨 Admin mode: Using {model_id}")
-
-        # Prepare strategies
-        # Get creative direction for Strategy C (in parallel with A & B)
-        creative_direction = None
-        if not request.referenceImage:
-            # Only run creative director if no reference image
-            creative_direction = await get_creative_direction(
-                model=model_id,
-                prompt=config.prompt
-            )
-
-        # Build strategies list (both expert and admin use all 3 strategies)
-        strategies = []
-        for idx, strategy_template in enumerate(POSTER_STRATEGIES):
-            strategy = strategy_template.copy()
-
-            # For Strategy C (ai-creative-director), fill in the directive
-            if strategy["name"] == "ai-creative-director":
-                if creative_direction:
-                    strategy["directive"] = build_creative_directive(creative_direction)
-                else:
-                    strategy["directive"] = FALLBACK_CREATIVE_DIRECTIVE
-
-            strategies.append(strategy)
-
-        # Generate 3 variants (both expert and admin modes)
-        posters = []
-        has_reference = bool(request.referenceImage)
-        total_variants = len(strategies)
-
-        for variant_idx, strategy in enumerate(strategies):
-            try:
-                # Strategy A & B use reference image (if provided)
-                # Strategy C doesn't use reference
-                use_reference = has_reference and strategy["type"] == "reference"
-
-                # Build user prompt
-                user_prompt = f"""POSTER DIMENSIONS: {dimensions.width}px × {dimensions.height}px
-
-USER'S PROMPT (this is what matters):
-"{config.prompt}"
-
-CREATOR BRANDING (for subtle attribution only):
-- Name: {profile.display_name}
-- Photo URL: {profile.profile_pic}
-- Handle: @{profile.username}
-
-CONTEXT DATA (use only if prompt specifically needs it):
-- Bio: {profile.bio}
-- Stats: {profile.total_bookings} bookings, {profile.average_rating}/5 rating"""
-
-                # Add top services if available
-                if profile.services:
-                    top_services = profile.services[:3]
-                    services_text = "\n".join(f"- {s.title}" for s in top_services)
-                    user_prompt += f"\n- Services:\n{services_text}"
-
-                # Add strategy directive
-                user_prompt += f"\n\nSTYLE DIRECTION: {strategy['directive']}\n\n"
-
-                if use_reference:
-                    user_prompt += """REFERENCE IMAGE PROVIDED: I've attached a reference image. Use it ONLY as VISUAL STYLE inspiration:
-- Color palette and mood
-- Typography style (fonts, sizing, weight) - NOT the actual text
-- Layout structure and composition
-- Visual effects and textures
-
-⚠️ CRITICAL: Do NOT copy any text, brand names, logos, slogans, or specific content from the reference image. The reference is for AESTHETIC DIRECTION only."""
-
-                user_prompt += "\n\nGenerate the HTML poster. Be creative with patterns, gradients, SVG, typography. Output only HTML starting with <!DOCTYPE html>"
-
-                # Call OpenRouter
-                print(f"🎨 Generating variant {variant_idx + 1}/{total_variants} ({strategy['name']})...")
-                html = await call_openrouter(
-                    model=model_id,
-                    system_prompt=POSTER_SYSTEM_PROMPT,
-                    user_prompt=user_prompt,
-                    reference_image=request.referenceImage if use_reference else None,
-                    max_tokens=12000
-                )
-
-                # Clean HTML
-                html = html.replace("```html\n", "").replace("```html", "")
-                html = html.replace("```\n", "").replace("```", "").strip()
-
-                # Find <!DOCTYPE if not at start
-                if not html.startswith("<!DOCTYPE"):
-                    idx = html.find("<!DOCTYPE")
-                    if idx != -1:
-                        html = html[idx:]
-
-                poster = GeneratedPoster(
-                    generationMode="html",
-                    html=html,
-                    dimensions=dimensions,
-                    style=config.style,
-                    topmateProfile=profile,
-                    generatedAt=datetime.utcnow().isoformat(),
-                    variantIndex=variant_idx,
-                    strategyName=strategy["name"]
-                )
-
-                posters.append(poster)
-                print(f"✅ Variant {variant_idx + 1}/{total_variants} generated successfully")
-
-            except Exception as e:
-                print(f"❌ Variant {variant_idx + 1} ({strategy['name']}) failed: {e}")
-                continue
-
-        if not posters:
-            raise HTTPException(
-                status_code=500,
-                detail="All poster generations failed. Please try again."
-            )
-
-        print(f"🎉 Generated {len(posters)}/{total_variants} variants successfully")
-
-        return GeneratePosterResponse(
-            success=True,
-            posters=posters,
-            mode="single"
+        
+        # Generate job ID
+        job_id = f"poster_{uuid.uuid4().hex[:12]}"
+        
+        # Initialize job in shared memory storage
+        set_ai_poster_job(job_id, {
+            "status": "queued",
+            "created_at": datetime.utcnow().isoformat(),
+            "result": None,
+            "error": None
+        })
+        
+        # Send initial SSE event
+        await sse_manager.send_progress(job_id, 0, 3, 0, 0, None, "queued")
+        await sse_manager.send_log(job_id, "INFO", "Job queued for processing")
+        
+        # Prepare request data for task
+        request_data = {
+            "config": {
+                "topmateUsername": config.topmateUsername,
+                "style": config.style,
+                "size": config.size,
+                "mode": config.mode,
+                "prompt": config.prompt,
+                "customDimensions": {"width": config.customDimensions.width, "height": config.customDimensions.height} if config.customDimensions else None,
+            },
+            "referenceImage": request.referenceImage,
+            "model": request.model,
+            "userMode": request.userMode,
+        }
+        
+        # Queue task to TaskIQ
+        await process_ai_poster_generation_task.kiq(
+            job_id=job_id,
+            request_data=request_data
         )
+        
+        logger.info("AI poster generation queued", job_id=job_id)
+        print(f"✅ Job queued: {job_id}")
+        
+        # Return immediately with SSE endpoint
+        return {
+            "success": True,
+            "job_id": job_id,
+            "status": "queued",
+            "sse_endpoint": f"/api/generate-poster/{job_id}/stream",
+            "message": "Generation started. Connect to SSE endpoint for real-time progress."
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Poster generation error: {e}")
+        logger.error("Poster generation error", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/generate-poster/{job_id}/stream")
+async def stream_poster_generation(job_id: str, request: Request):
+    """
+    SSE endpoint for streaming AI poster generation progress
+    
+    Events:
+    - connected: Connection established
+    - progress: Generation progress (0-3 variants)
+    - log: Log messages
+    - job_completed: All variants generated with full result
+    - job_failed: Generation failed
+    - heartbeat: Keep-alive signal
+    """
+    # Check job exists
+    job = get_ai_poster_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    # Create connection
+    connection_id = f"poster_conn_{uuid.uuid4().hex[:8]}"
+    logger.info("SSE connection for poster generation", job_id=job_id, connection_id=connection_id)
+    
+    connection = await sse_manager.connect(job_id, connection_id)
+    
+    # Send initial status
+    await connection.send("status", {
+        "job_id": job_id,
+        "status": job["status"],
+        "phase": "starting"
+    })
+    
+    async def event_generator():
+        poll_interval = 1.0  # Wait for events from Redis pub/sub
+        max_wait = 180  # 3 minutes max for AI generation
+        waited = 0
+        
+        try:
+            while waited < max_wait:
+                if await request.is_disconnected():
+                    logger.info("SSE client disconnected", job_id=job_id)
+                    break
+                
+                try:
+                    # Wait for events from Redis pub/sub via connection queue
+                    event = await asyncio.wait_for(connection.queue.get(), timeout=poll_interval)
+                    
+                    yield ServerSentEvent(
+                        data=json.dumps(event["data"]),
+                        event=event["event"]
+                    )
+                    
+                    # Check if completed or failed
+                    if event["event"] in ("job_completed", "job_failed"):
+                        break
+                        
+                except asyncio.TimeoutError:
+                    waited += poll_interval
+                    
+                    # Send heartbeat every 10 seconds to keep connection alive
+                    if int(waited) % 10 == 0 and waited > 0:
+                        yield ServerSentEvent(
+                            data=json.dumps({"status": "alive", "waited": round(waited, 1)}),
+                            event="heartbeat"
+                        )
+            
+            # Timeout
+            if waited >= max_wait:
+                yield ServerSentEvent(
+                    data=json.dumps({"job_id": job_id, "error": "Generation timeout"}),
+                    event="job_failed"
+                )
+                
+        except Exception as e:
+            logger.error("SSE stream error", job_id=job_id, error=str(e))
+            yield ServerSentEvent(data=json.dumps({"error": str(e)}), event="error")
+        finally:
+            await sse_manager.disconnect(connection_id)
+    
+    return EventSourceResponse(event_generator())
+
+
+@router.get("/generate-poster/{job_id}/result")
+async def get_poster_result(job_id: str):
+    """
+    Get the result of a completed poster generation job.
+    Use this as fallback if SSE doesn't work.
+    """
+    job = get_ai_poster_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    if job["status"] == "completed" and job.get("result"):
+        return job["result"]
+    elif job["status"] == "failed":
+        raise HTTPException(status_code=500, detail=job.get("error", "Generation failed"))
+    else:
+        return {
+            "success": False,
+            "status": job["status"],
+            "message": "Job is still processing"
+        }

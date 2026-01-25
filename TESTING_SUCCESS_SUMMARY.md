@@ -145,7 +145,7 @@ template_gen_4148d9d6f362 | unknown   | completed | 9119               | https:/
 
 ---
 
-## 📊 Performance
+##  Performance
 
 - **Queue time:** < 100ms
 - **Processing time:** 9.1 seconds (includes HTML rendering + S3 upload)

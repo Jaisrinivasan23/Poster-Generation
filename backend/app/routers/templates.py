@@ -2,10 +2,13 @@
 Template Management Router
 For external backend integration (Django Topmate)
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
+from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 from typing import Optional, List, Dict, Any
 import time
 import json
+import asyncio
 from datetime import datetime
 from uuid import UUID
 
@@ -33,8 +36,12 @@ from app.services.template_service import (
 )
 from app.services.database import database_service
 from app.services.storage_service import upload_to_s3
+from app.services.sse_manager import sse_manager
 from app.tasks.poster_tasks import process_template_poster_task, process_batch_template_job_task
 import uuid
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
@@ -129,17 +136,14 @@ async def upload_template(request: UploadTemplateRequest):
 @router.post("/templates/generate")
 async def generate_from_template(request: GenerateFromTemplateRequest):
     """
-    Generate poster from template using TaskIQ + RedPanda (parallel processing, waits for result)
+    Generate poster from template using TaskIQ (fast async, returns immediately with SSE endpoint)
 
     Request: {"template_id": "testimonial_latest", "custom_data": {...}, "metadata": {...}}
-    Response: {"url": "...", "template_version_used": 3, "template_name": "...", "generation_time_ms": 1250}
+    Response: {"job_id": "...", "status": "queued", "sse_endpoint": "/api/templates/generate/{job_id}/stream"}
 
-    - Queues generation task to RedPanda for parallel processing
-    - Waits for completion and returns direct response
+    - Returns immediately with job_id and SSE endpoint for real-time progress
+    - Use SSE stream to get progress updates and final result
     """
-    import json
-    import asyncio
-
     try:
         async with database_service.connection() as conn:
             # Parse template_id to get section
@@ -191,13 +195,26 @@ async def generate_from_template(request: GenerateFromTemplateRequest):
                 """,
                 job_id,
                 'INFO',
-                f"Poster generation queued for section: {section}",
-                json.dumps({'template_id': request.template_id, 'section': section, 'custom_data': request.custom_data})
+                f"Poster generation started for section: {section}",
+                json.dumps({'template_id': request.template_id, 'section': section})
             )
 
-            print(f"✅ Job queued: {job_id} (section: {section})")
+            logger.info("Template generation job created", job_id=job_id, section=section)
+            print(f"✅ Job created: {job_id} (section: {section})")
 
-        # Queue single poster task to TaskIQ -> RedPanda
+        # Send immediate SSE progress event (0% - starting)
+        await sse_manager.send_progress(
+            job_id=job_id,
+            processed=0,
+            total=1,
+            success_count=0,
+            failure_count=0,
+            current_user=None,
+            phase="starting"
+        )
+        await sse_manager.send_log(job_id, "INFO", f"Starting poster generation for {section}")
+
+        # Queue to TaskIQ (non-blocking)
         await process_template_poster_task.kiq(
             job_id=job_id,
             template_id=request.template_id,
@@ -205,46 +222,166 @@ async def generate_from_template(request: GenerateFromTemplateRequest):
             metadata=request.metadata
         )
 
-        # Wait for task completion (poll database)
-        max_attempts = 60  # 60 seconds timeout
-        for attempt in range(max_attempts):
-            await asyncio.sleep(1)  # Poll every second
-
-            async with database_service.connection() as conn:
-                result = await conn.fetchrow(
-                    """
-                    SELECT output_url, generation_time_ms, status, error_message
-                    FROM template_poster_results
-                    WHERE job_id = $1
-                    """,
-                    job_id
-                )
-
-                if result:
-                    if result['status'] == 'completed' and result['output_url']:
-                        # Success - return direct response
-                        return {
-                            "url": result['output_url'],
-                            "template_version_used": template['version'],
-                            "template_name": template['name'],
-                            "generation_time_ms": result['generation_time_ms'] or 0
-                        }
-                    elif result['status'] == 'failed':
-                        # Failed
-                        error_msg = result['error_message'] or 'Generation failed'
-                        raise HTTPException(status_code=500, detail=error_msg)
-
-        # Timeout
-        raise HTTPException(
-            status_code=504,
-            detail="Generation timeout - poster generation took too long"
-        )
+        # Return immediately with SSE endpoint
+        return {
+            "success": True,
+            "job_id": job_id,
+            "status": "queued",
+            "template_version": template['version'],
+            "template_name": template['name'],
+            "sse_endpoint": f"/api/templates/generate/{job_id}/stream",
+            "poll_endpoint": f"/api/templates/job/{job_id}",
+            "message": "Generation started. Connect to SSE endpoint for real-time progress."
+        }
 
     except HTTPException:
         raise
     except Exception as e:
+        logger.error("Template generation error", error=str(e))
         print(f"❌ Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/templates/generate/{job_id}/stream")
+async def stream_template_generation(job_id: str, request: Request):
+    """
+    SSE endpoint for streaming single template generation progress
+    
+    Connect to receive real-time updates:
+    - connected: Connection established
+    - progress: Generation progress (0% -> 100%)
+    - poster_completed: Generation finished with URL
+    - job_failed: Generation failed
+    - heartbeat: Keep-alive signal
+    """
+    # Verify job exists
+    async with database_service.connection() as conn:
+        job = await conn.fetchrow(
+            """
+            SELECT job_id, status, template_section, template_version
+            FROM template_generation_jobs
+            WHERE job_id = $1
+            """,
+            job_id
+        )
+        
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+    
+    # Create unique connection ID
+    connection_id = f"tpl_conn_{uuid.uuid4().hex[:8]}"
+    
+    logger.info("Template SSE connection requested", job_id=job_id, connection_id=connection_id)
+    
+    # Register connection
+    connection = await sse_manager.connect(job_id, connection_id)
+    
+    # Send initial status
+    await connection.send("status", {
+        "job_id": job_id,
+        "status": job["status"],
+        "processed": 0,
+        "total": 1,
+        "phase": "starting"
+    })
+    
+    async def event_generator():
+        poll_interval = 0.5  # Poll every 500ms for faster updates
+        max_wait = 120  # 2 minutes max
+        waited = 0
+        
+        try:
+            while waited < max_wait:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    logger.info("SSE client disconnected", job_id=job_id)
+                    break
+
+                # Try to get event from queue with short timeout for responsiveness
+                try:
+                    event = await asyncio.wait_for(connection.queue.get(), timeout=poll_interval)
+
+                    # Yield the event
+                    yield ServerSentEvent(
+                        data=json.dumps(event["data"]),
+                        event=event["event"]
+                    )
+
+                    # Check if job completed/failed
+                    if event["event"] in ("poster_completed", "job_completed", "job_failed"):
+                        logger.info("Template generation finished", job_id=job_id, event=event["event"])
+                        break
+
+                except asyncio.TimeoutError:
+                    waited += poll_interval
+                    
+                    # Check database for completion (backup mechanism)
+                    async with database_service.connection() as conn:
+                        result = await conn.fetchrow(
+                            """
+                            SELECT output_url, generation_time_ms, status, error_message, template_version
+                            FROM template_poster_results
+                            WHERE job_id = $1
+                            """,
+                            job_id
+                        )
+                        
+                        if result:
+                            if result['status'] == 'completed' and result['output_url']:
+                                # Send completion event
+                                yield ServerSentEvent(
+                                    data=json.dumps({
+                                        "job_id": job_id,
+                                        "success": True,
+                                        "url": result['output_url'],
+                                        "generation_time_ms": result['generation_time_ms'] or 0,
+                                        "template_version": result['template_version']
+                                    }),
+                                    event="poster_completed"
+                                )
+                                logger.info("Template generation completed (from DB)", job_id=job_id)
+                                break
+                            elif result['status'] == 'failed':
+                                # Send failure event
+                                yield ServerSentEvent(
+                                    data=json.dumps({
+                                        "job_id": job_id,
+                                        "success": False,
+                                        "error": result['error_message'] or 'Generation failed'
+                                    }),
+                                    event="job_failed"
+                                )
+                                logger.info("Template generation failed (from DB)", job_id=job_id)
+                                break
+                    
+                    # Send heartbeat every 5 seconds
+                    if int(waited) % 5 == 0 and waited > 0:
+                        yield ServerSentEvent(
+                            data=json.dumps({"status": "alive", "waited": waited}),
+                            event="heartbeat"
+                        )
+
+            # If we timed out, send error
+            if waited >= max_wait:
+                yield ServerSentEvent(
+                    data=json.dumps({"job_id": job_id, "error": "Generation timeout"}),
+                    event="job_failed"
+                )
+
+        except Exception as e:
+            logger.error("SSE stream error", job_id=job_id, error=str(e))
+            try:
+                yield ServerSentEvent(
+                    data=json.dumps({"error": str(e)}),
+                    event="error"
+                )
+            except:
+                pass
+        finally:
+            await sse_manager.disconnect(connection_id)
+            logger.info("Template SSE connection closed", job_id=job_id, connection_id=connection_id)
+
+    return EventSourceResponse(event_generator())
 
 
 @router.get("/templates/job/{job_id}")
@@ -376,7 +513,7 @@ async def list_templates(section: Optional[str] = None):
             if section:
                 templates = await conn.fetch(
                     """
-                    SELECT id, section, name, version, is_active, created_at
+                    SELECT id, section, name, version, is_active, created_at, html_content, css_content
                     FROM templates
                     WHERE section = $1
                     ORDER BY version DESC
@@ -386,7 +523,7 @@ async def list_templates(section: Optional[str] = None):
             else:
                 templates = await conn.fetch(
                     """
-                    SELECT id, section, name, version, is_active, created_at
+                    SELECT id, section, name, version, is_active, created_at, html_content, css_content
                     FROM templates
                     ORDER BY section, version DESC
                     """
@@ -409,6 +546,8 @@ async def list_templates(section: Optional[str] = None):
                     version=t['version'],
                     is_active=t['is_active'],
                     created_at=t['created_at'],
+                    html_content=t['html_content'],
+                    css_content=t['css_content'],
                     placeholders=[
                         PlaceholderInfo(name=p['placeholder_name'], sample_value=p['sample_value'])
                         for p in placeholders

@@ -187,7 +187,7 @@ export function useJobSSE(options: UseJobSSEOptions = {}): UseJobSSEResult {
 
     eventSource.addEventListener('status', (e) => {
       const data: SSEStatusEvent = JSON.parse(e.data);
-      console.log('📊 Status event:', data);
+      console.log(' Status event:', data);
       setProgress({
         job_id: data.job_id,
         processed: data.processed,

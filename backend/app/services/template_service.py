@@ -75,37 +75,37 @@ def extract_dimensions(html: str) -> Dict[str, int]:
 
 def extract_placeholders(html: str) -> List[str]:
     """
-    Extract all {{placeholder}} from HTML
+    Extract all {placeholder} from HTML
 
     Args:
-        html: HTML content with {{placeholder}} syntax
+        html: HTML content with {placeholder} syntax
 
     Returns:
         List of unique placeholder names
 
     Example:
-        >>> extract_placeholders("<h1>{{consumer_name}}</h1><p>{{consumer_message}}</p>")
+        >>> extract_placeholders("<h1>{consumer_name}</h1><p>{consumer_message}</p>")
         ['consumer_name', 'consumer_message']
     """
-    pattern = r'\{\{([^}]+)\}\}'
+    pattern = r'\{([a-zA-Z_][a-zA-Z0-9_.]*)\}'
     matches = re.findall(pattern, html)
     return list(set([m.strip() for m in matches]))
 
 
 def replace_placeholders(html: str, data: Dict[str, Any]) -> str:
     """
-    Replace {{key}} with value from data
-    Supports nested keys like {{overlay.fill_color}}
+    Replace {key} with value from data
+    Supports nested keys like {overlay.fill_color}
 
     Args:
-        html: HTML content with {{placeholder}} syntax
+        html: HTML content with {placeholder} syntax
         data: Dictionary with placeholder values (supports nested dicts)
 
     Returns:
         HTML with placeholders replaced
 
     Example:
-        >>> html = "<h1>{{name}}</h1><div style='background: {{overlay.fill_color}}'></div>"
+        >>> html = "<h1>{name}</h1><div style='background: {overlay.fill_color}'></div>"
         >>> replace_placeholders(html, {'name': 'John', 'overlay': {'fill_color': '#FF0000'}})
         '<h1>John</h1><div style='background: #FF0000'></div>'
     """
@@ -119,11 +119,11 @@ def replace_placeholders(html: str, data: Dict[str, Any]) -> str:
             if isinstance(value, dict) and key in value:
                 value = value[key]
             else:
-                return f'{{{{{path}}}}}'  # Return original placeholder if not found
+                return f'{{{path}}}'  # Return original placeholder if not found
         return str(value)
     
     # Find all placeholders in HTML
-    pattern = r'\{\{([^}]+)\}\}'
+    pattern = r'\{([a-zA-Z_][a-zA-Z0-9_.]*)\}'
     
     def replace_match(match):
         placeholder_key = match.group(1).strip()

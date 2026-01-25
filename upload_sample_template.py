@@ -126,7 +126,7 @@ def upload_template():
         if response.status_code == 200:
             result = response.json()
             print(f"✅ Template uploaded successfully!")
-            print(f"\n📊 Details:")
+            print(f"\n Details:")
             print(f"   Template ID: {result['template_id']}")
             print(f"   Version: {result['version']}")
             print(f"   Section: {result['section']}")

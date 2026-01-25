@@ -54,6 +54,8 @@ class TemplateInfo(BaseModel):
     is_active: bool
     created_at: datetime
     placeholders: List[PlaceholderInfo] = []
+    html_content: Optional[str] = None
+    css_content: Optional[str] = None
 
 
 class UploadTemplateResponse(BaseModel):
