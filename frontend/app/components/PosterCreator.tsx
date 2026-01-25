@@ -17,7 +17,7 @@ import TopmateShare from './TopmateShare';
 import { PosterFlowMode } from '../types/poster';
 import { getTopmateLogo } from '../lib/topmate-logo';
 import { fetchTopmateProfile } from '../lib/topmate';
-import { apiFetch } from '../lib/api';
+import { apiFetch, listTemplates, uploadTemplate, type Template as DbTemplate } from '../lib/api';
 import { useJobSSE, SSEProgressEvent, SSEPosterCompletedEvent, SSEJobCompletedEvent, SSELogEvent } from '../hooks/useJobSSE';
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_API_URL || 'http://localhost:8000';
@@ -66,6 +66,10 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
   const [csvSaveSuccess, setCsvSaveSuccess] = useState(false);
   const [csvSavedConfig, setCsvSavedConfig] = useState<{campaign: string, content_type: string} | null>(null);
   const [csvSaveProgress, setCsvSaveProgress] = useState<{processed: number, total: number, success: number, failed: number} | null>(null);
+  const [isSavingToDb, setIsSavingToDb] = useState(false); // Track save operation
+  const [saveJobId, setSaveJobId] = useState<string | null>(null); // Track save job ID
+  const [saveLogs, setSaveLogs] = useState<string[]>([]); // Logs during save
+  const [showSaveLogs, setShowSaveLogs] = useState(false); // Toggle save logs visibility
 
   // Template mode states (for external backend integration)
   const [templateSection, setTemplateSection] = useState('');
@@ -94,6 +98,20 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
   const [slideCount, setSlideCount] = useState(5);
   const [selectedModel, setSelectedModel] = useState<'pro' | 'flash'>('pro');
   const [generationMode, setGenerationMode] = useState<GenerationMode>('html'); // HTML or Image generation
+
+  // CSV Template Selection states (for using existing templates from DB)
+  const [csvTemplateSource, setCsvTemplateSource] = useState<'paste' | 'existing'>('paste'); // Template source mode
+  const [availableDbTemplates, setAvailableDbTemplates] = useState<any[]>([]); // Templates from DB
+  const [selectedDbTemplate, setSelectedDbTemplate] = useState<any | null>(null); // Currently selected template from DB
+  const [isLoadingDbTemplates, setIsLoadingDbTemplates] = useState(false); // Loading state for templates
+  const [showDbTemplatePreview, setShowDbTemplatePreview] = useState(false); // Show template preview modal
+  
+  // CSV Template Save states (for saving pasted HTML to DB)
+  const [showSaveTemplateForm, setShowSaveTemplateForm] = useState(false); // Show save template form
+  const [saveTemplateSection, setSaveTemplateSection] = useState(''); // Section for saving template
+  const [saveTemplateName, setSaveTemplateName] = useState(''); // Name for saving template
+  const [isSavingTemplate, setIsSavingTemplate] = useState(false); // Saving template loading state
+  const [saveTemplateSuccess, setSaveTemplateSuccess] = useState<string | null>(null); // Success message
 
   // Dynamic templates and fonts
   const [allTemplates, setAllTemplates] = useState<Template[]>(TEMPLATE_IMAGES);
@@ -365,6 +383,89 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
     };
     loadResources();
   }, []);
+
+  // Fetch DB templates for bulk generation when switching to existing template mode
+  const fetchDbTemplates = useCallback(async () => {
+    setIsLoadingDbTemplates(true);
+    try {
+      const data = await listTemplates();
+      setAvailableDbTemplates(data.templates || []);
+      console.log('📋 [DB Templates] Loaded', data.templates?.length || 0, 'templates');
+    } catch (error) {
+      console.error('❌ [DB Templates] Failed to load templates:', error);
+      setError('Failed to load templates from database');
+    } finally {
+      setIsLoadingDbTemplates(false);
+    }
+  }, []);
+
+  // Fetch templates when switching to "existing" template source
+  useEffect(() => {
+    if (csvTemplateSource === 'existing') {
+      fetchDbTemplates();
+    }
+  }, [csvTemplateSource, fetchDbTemplates]);
+
+  // Handle selecting a template from DB
+  const handleSelectDbTemplate = (template: any) => {
+    setSelectedDbTemplate(template);
+    setCsvTemplate(template.html_content || '');
+    // Extract dimensions from template if available, otherwise use default
+    setCsvCustomWidth(1080);
+    setCsvCustomHeight(1080);
+    console.log('✅ [DB Template] Selected:', template.name, 'v' + template.version);
+  };
+
+  // Save pasted HTML template to database
+  const handleSaveTemplateToDb = async () => {
+    if (!saveTemplateSection.trim()) {
+      setError('Please enter a section name');
+      return;
+    }
+    if (!saveTemplateName.trim()) {
+      setError('Please enter a template name');
+      return;
+    }
+    if (!csvTemplate.trim()) {
+      setError('Please paste HTML template first');
+      return;
+    }
+
+    setIsSavingTemplate(true);
+    setError(null);
+    setSaveTemplateSuccess(null);
+
+    try {
+      const result = await uploadTemplate({
+        section: saveTemplateSection.trim(),
+        name: saveTemplateName.trim(),
+        html_content: csvTemplate,
+        css_content: '',
+        set_as_active: true
+      });
+
+      setSaveTemplateSuccess(`Template saved! Version ${result.version}`);
+      console.log('✅ [Save Template] Saved to DB:', result);
+      
+      // Clear the save form after success
+      setTimeout(() => {
+        setShowSaveTemplateForm(false);
+        setSaveTemplateSection('');
+        setSaveTemplateName('');
+        setSaveTemplateSuccess(null);
+      }, 2000);
+
+      // Refresh templates list if in existing mode
+      if (csvTemplateSource === 'existing') {
+        fetchDbTemplates();
+      }
+    } catch (err: any) {
+      console.error('❌ [Save Template] Error:', err);
+      setError(err.message || 'Failed to save template');
+    } finally {
+      setIsSavingTemplate(false);
+    }
+  };
 
   // Admin: Upload template image
   const handleUploadTemplate = async (file: File) => {
@@ -1396,23 +1497,6 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
             {flowMode === 'bulk' && (
               <>
                 {/* Info Banner - CSV Bulk Generation */}
-                <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
-                  <div className="flex items-start">
-                    <div className="flex-shrink-0">
-                      <svg className="h-5 w-5 text-blue-400" viewBox="0 0 20 20" fill="currentColor">
-                        <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
-                      </svg>
-                    </div>
-                    <div className="ml-3">
-                      <h3 className="text-sm font-medium text-blue-800"> CSV Bulk Generation Flow</h3>
-                      <p className="mt-1 text-sm text-blue-700">
-                        <strong>Step 1:</strong> Upload CSV file with your data (must include "username" column).<br />
-                        <strong>Step 2:</strong> Create HTML template using CSV column names as placeholders.<br />
-                        <strong>Step 3:</strong> Preview, name your campaign, and generate posters for all rows.
-                      </p>
-                    </div>
-                  </div>
-                </div>
               </>
             )}
 
@@ -1775,6 +1859,206 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                         Use <code className="bg-slate-100 px-1 py-0.5 rounded">{`{column_name}`}</code> syntax. Available columns: {csvColumns.map(col => <code key={col} className="bg-slate-100 px-1 py-0.5 rounded mx-1">{`{${col}}`}</code>)}
                       </p>
 
+                      {/* Template Source Selector */}
+                      <div className="mb-4 flex gap-2">
+                        <button
+                          onClick={() => setCsvTemplateSource('paste')}
+                          className={`flex-1 py-2 px-4 text-sm font-medium rounded-lg transition-colors flex items-center justify-center gap-2 ${
+                            csvTemplateSource === 'paste'
+                              ? 'bg-purple-600 text-white'
+                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                          }`}
+                        >
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                          </svg>
+                          Paste HTML
+                        </button>
+                        <button
+                          onClick={() => setCsvTemplateSource('existing')}
+                          className={`flex-1 py-2 px-4 text-sm font-medium rounded-lg transition-colors flex items-center justify-center gap-2 ${
+                            csvTemplateSource === 'existing'
+                              ? 'bg-purple-600 text-white'
+                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                          }`}
+                        >
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                          </svg>
+                          Use Existing Template
+                        </button>
+                      </div>
+
+                      {/* Existing Templates Selection */}
+                      {csvTemplateSource === 'existing' && (
+                        <div className="mb-4 p-4 bg-purple-50 border border-purple-200 rounded-lg">
+                          <div className="flex items-center justify-between mb-3">
+                            <h4 className="text-sm font-medium text-purple-900">Select Template from Library</h4>
+                            <button
+                              onClick={fetchDbTemplates}
+                              className="text-xs text-purple-600 hover:text-purple-800 flex items-center gap-1"
+                            >
+                              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                              </svg>
+                              Refresh
+                            </button>
+                          </div>
+
+                          {isLoadingDbTemplates ? (
+                            <div className="flex items-center justify-center py-6 text-purple-600">
+                              <svg className="animate-spin h-5 w-5 mr-2" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                              </svg>
+                              Loading templates...
+                            </div>
+                          ) : availableDbTemplates.length === 0 ? (
+                            <div className="text-center py-6 text-slate-500">
+                              <svg className="w-10 h-10 mx-auto mb-2 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                              </svg>
+                              <p className="text-sm">No templates found</p>
+                              <p className="text-xs text-slate-400 mt-1">Upload templates in the Template Manager</p>
+                            </div>
+                          ) : (
+                            <div className="grid grid-cols-1 gap-2 max-h-60 overflow-y-auto">
+                              {availableDbTemplates.map((template) => (
+                                <div
+                                  key={template.id}
+                                  onClick={() => handleSelectDbTemplate(template)}
+                                  className={`p-3 rounded-lg border cursor-pointer transition-all ${
+                                    selectedDbTemplate?.id === template.id
+                                      ? 'border-purple-500 bg-purple-100'
+                                      : 'border-slate-200 bg-white hover:border-purple-300 hover:bg-purple-50'
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between">
+                                    <div className="flex-1 min-w-0">
+                                      <div className="flex items-center gap-2">
+                                        <h5 className="text-sm font-medium text-slate-900 truncate">{template.name}</h5>
+                                        <span className="px-2 py-0.5 bg-slate-100 text-slate-600 text-xs rounded">
+                                          {template.section}
+                                        </span>
+                                        {template.is_active && (
+                                          <span className="px-2 py-0.5 bg-green-100 text-green-700 text-xs font-medium rounded">
+                                            Active
+                                          </span>
+                                        )}
+                                      </div>
+                                      <p className="text-xs text-slate-500 mt-1">
+                                        Version {template.version} • {template.placeholders?.length || 0} placeholders
+                                      </p>
+                                    </div>
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setSelectedDbTemplate(template);
+                                        setShowDbTemplatePreview(true);
+                                      }}
+                                      className="ml-2 p-1.5 text-slate-400 hover:text-purple-600 hover:bg-purple-100 rounded transition-colors"
+                                      title="Preview template"
+                                    >
+                                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                                      </svg>
+                                    </button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          {selectedDbTemplate && (
+                            <div className="mt-3 p-3 bg-green-50 border border-green-200 rounded-lg">
+                              <div className="flex items-center gap-2 text-green-800">
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                </svg>
+                                <span className="text-sm font-medium">Selected: {selectedDbTemplate.name}</span>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Template Preview Modal */}
+                      {showDbTemplatePreview && selectedDbTemplate && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                          <div className="bg-white rounded-xl shadow-2xl max-w-4xl w-full max-h-[90vh] overflow-hidden">
+                            <div className="flex items-center justify-between p-4 border-b border-slate-200">
+                              <h3 className="text-lg font-semibold text-slate-900">
+                                {selectedDbTemplate.name} - Preview
+                              </h3>
+                              <button
+                                onClick={() => setShowDbTemplatePreview(false)}
+                                className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-colors"
+                              >
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                                </svg>
+                              </button>
+                            </div>
+                            <div className="p-4 overflow-auto max-h-[70vh]">
+                              <div className="flex justify-center bg-slate-100 rounded-lg p-4">
+                                <div 
+                                  className="relative bg-white shadow-lg rounded-lg overflow-hidden"
+                                  style={{ width: '350px', height: '350px' }}
+                                >
+                                  <div
+                                    style={{
+                                      transform: 'scale(0.32)',
+                                      transformOrigin: 'top left',
+                                      width: '1080px',
+                                      height: '1080px',
+                                      position: 'absolute',
+                                      top: 0,
+                                      left: 0,
+                                    }}
+                                  >
+                                    <iframe
+                                      srcDoc={`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{margin:0;padding:0;}${selectedDbTemplate.css_content || ''}</style></head><body>${selectedDbTemplate.html_content || ''}</body></html>`}
+                                      className="w-full h-full border-0"
+                                      style={{ width: '1080px', height: '1080px', pointerEvents: 'none' }}
+                                      title="Template Preview"
+                                      sandbox="allow-same-origin"
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="mt-4">
+                                <h4 className="text-sm font-medium text-slate-700 mb-2">Placeholders:</h4>
+                                <div className="flex flex-wrap gap-2">
+                                  {selectedDbTemplate.placeholders?.map((p: any) => (
+                                    <span key={p.name} className="px-2 py-1 bg-purple-100 text-purple-700 text-xs rounded">
+                                      {`{${p.name}}`}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            </div>
+                            <div className="flex justify-end gap-3 p-4 border-t border-slate-200 bg-slate-50">
+                              <button
+                                onClick={() => setShowDbTemplatePreview(false)}
+                                className="px-4 py-2 text-slate-600 hover:text-slate-800 font-medium transition-colors"
+                              >
+                                Close
+                              </button>
+                              <button
+                                onClick={() => {
+                                  handleSelectDbTemplate(selectedDbTemplate);
+                                  setShowDbTemplatePreview(false);
+                                }}
+                                className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white font-medium rounded-lg transition-colors"
+                              >
+                                Use This Template
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
                       {/* Custom Dimensions */}
                       <div className="mb-3 flex gap-4">
                         <div className="flex-1">
@@ -1811,10 +2095,13 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                         </label>
                       </div>
 
-                      <textarea
-                        value={csvTemplate}
-                        onChange={(e) => setCsvTemplate(e.target.value)}
-                        placeholder={`<!DOCTYPE html>
+                      {/* Paste HTML Textarea - only show in paste mode */}
+                      {csvTemplateSource === 'paste' && (
+                        <>
+                          <textarea
+                            value={csvTemplate}
+                            onChange={(e) => setCsvTemplate(e.target.value)}
+                            placeholder={`<!DOCTYPE html>
 <html>
 <head>
   <style>
@@ -1848,6 +2135,89 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                         </div>
                       </div>
 
+                      {/* Save Template to Database Button */}
+                      {csvTemplate.trim() && (
+                        <div className="mt-3">
+                          <button
+                            onClick={() => setShowSaveTemplateForm(!showSaveTemplateForm)}
+                            className="w-full py-2 px-4 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-medium rounded-lg transition-colors flex items-center justify-center gap-2"
+                          >
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
+                            </svg>
+                            {showSaveTemplateForm ? 'Hide Save Form' : 'Save as Reusable Template'}
+                          </button>
+
+                          {showSaveTemplateForm && (
+                            <div className="mt-3 p-4 bg-green-50 border border-green-200 rounded-lg">
+                              <h4 className="text-sm font-medium text-green-900 mb-3">Save Template to Library</h4>
+                              <div className="space-y-3">
+                                <div>
+                                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                                    Section <span className="text-red-500">*</span>
+                                  </label>
+                                  <input
+                                    type="text"
+                                    value={saveTemplateSection}
+                                    onChange={(e) => setSaveTemplateSection(e.target.value)}
+                                    placeholder="e.g., testimonial, sales, promo"
+                                    className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 text-sm"
+                                  />
+                                  <p className="text-xs text-slate-500 mt-1">Category for organizing templates</p>
+                                </div>
+                                <div>
+                                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                                    Template Name <span className="text-red-500">*</span>
+                                  </label>
+                                  <input
+                                    type="text"
+                                    value={saveTemplateName}
+                                    onChange={(e) => setSaveTemplateName(e.target.value)}
+                                    placeholder="e.g., Modern Gradient Design"
+                                    className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 text-sm"
+                                  />
+                                </div>
+                                {saveTemplateSuccess && (
+                                  <div className="p-2 bg-green-100 border border-green-300 rounded-lg text-sm text-green-800 flex items-center gap-2">
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                    </svg>
+                                    {saveTemplateSuccess}
+                                  </div>
+                                )}
+                                <button
+                                  onClick={handleSaveTemplateToDb}
+                                  disabled={isSavingTemplate || !saveTemplateSection.trim() || !saveTemplateName.trim()}
+                                  className="w-full py-2 px-4 bg-green-600 hover:bg-green-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-colors flex items-center justify-center gap-2"
+                                >
+                                  {isSavingTemplate ? (
+                                    <>
+                                      <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                                      </svg>
+                                      Saving...
+                                    </>
+                                  ) : (
+                                    <>
+                                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                      </svg>
+                                      Save to Template Library
+                                    </>
+                                  )}
+                                </button>
+                                <p className="text-xs text-slate-500">
+                                  Template will be available in "Use Existing Template" and the Template Manager.
+                                </p>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                        </>
+                      )}
+
                       {csvTemplate.trim() && (
                         <>
                           <button
@@ -1867,433 +2237,22 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
                               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
                             </svg>
-                            {csvPreview ? 'Update Preview' : 'Preview with First Row'}
+                            {csvPreview ? 'Update Preview' : 'Preview Template →'}
                           </button>
 
+                          {/* Campaign Name - Only show after preview is ready */}
                           {csvPreview && (
-                            <div className="mt-4">
-                              <div className="flex items-center justify-between mb-2">
-                                <label className="text-sm font-medium text-slate-700">Template Preview (First Row Data)</label>
-                                <button
-                                  onClick={() => setCsvPreview('')}
-                                  className="text-xs text-red-500 hover:text-red-600 font-medium"
-                                >
-                                  Hide Preview
-                                </button>
-                              </div>
-                              <div className="border-2 border-slate-300 rounded-lg overflow-hidden bg-slate-50 p-4 flex justify-center">
-                                <div style={{
-                                  width: `${csvCustomWidth * 0.5}px`,
-                                  height: `${csvCustomHeight * 0.5}px`,
-                                  transform: 'scale(0.5)',
-                                  transformOrigin: 'top left',
-                                  border: '1px solid #e2e8f0'
-                                }}>
-                                  <iframe
-                                    srcDoc={csvPreview}
-                                    className="w-full h-full border-0"
-                                    style={{ width: `${csvCustomWidth}px`, height: `${csvCustomHeight}px`, pointerEvents: 'none' }}
-                                    title="CSV Preview"
-                                    sandbox="allow-same-origin allow-scripts"
-                                  />
-                                </div>
-                              </div>
-                              <p className="mt-2 text-xs text-slate-500 text-center">
-                                Preview with first row data. Will generate for all {csvData.length} rows.
-                              </p>
-
-                              {/* Campaign Name */}
-                              <div className="mt-6 p-4 bg-slate-50 rounded-lg border-2 border-slate-200">
-                                <label className="block text-sm font-medium text-slate-700 mb-2">
-                                  Step 3: Campaign Name
-                                </label>
-                                <input
-                                  type="text"
-                                  value={csvCampaignName}
-                                  onChange={(e) => setCsvCampaignName(e.target.value)}
-                                  placeholder="e.g., Q4 Sales Campaign"
-                                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm"
-                                />
-                              </div>
-
-                              {/* Generate Button */}
-                              <button
-                                onClick={async () => {
-                                  if (!csvCampaignName.trim()) {
-                                    alert('Please enter a campaign name');
-                                    return;
-                                  }
-
-                                  setIsCsvGenerating(true);
-                                  setCsvGeneratedResults([]);
-                                  setCsvProgress({ processed: 0, total: csvData.length, percentage: 0 });
-                                  setCsvLogs(['🚀 Starting CSV bulk generation...']);
-                                  setShowCsvLogs(true);
-                                  setError(null);
-
-                                  try {
-                                    const topmateLogo = getTopmateLogo();
-
-                                    const response = await apiFetch('/api/generate-bulk', {
-                                      method: 'POST',
-                                      headers: { 'Content-Type': 'application/json' },
-                                      body: JSON.stringify({
-                                        bulkMethod: 'csv',
-                                        csvTemplate: csvTemplate,
-                                        csvData: csvData,
-                                        csvColumns: csvColumns,
-                                        posterName: csvCampaignName.trim(),
-                                        size: 'custom',
-                                        customWidth: csvCustomWidth,
-                                        customHeight: csvCustomHeight,
-                                        skipOverlays: csvSkipOverlays,
-                                        topmateLogo: csvSkipOverlays ? null : topmateLogo,
-                                      }),
-                                    });
-
-                                    const data = await response.json();
-
-                                    if (!response.ok) {
-                                      throw new Error(data.error || 'Generation failed');
-                                    }
-
-                                    // Check if response has jobId (RedPanda queue mode)
-                                    if (data.success && data.jobId) {
-                                      console.log('🔗 [CSV] Connecting to SSE for job:', data.jobId);
-                                      console.log('✅ [CSV] Setting csvJobId state:', data.jobId);
-                                      setCsvJobId(data.jobId);
-
-                                      // BACKUP: Store in localStorage to prevent loss
-                                      localStorage.setItem('lastCsvJobId', data.jobId);
-                                      console.log('💾 [CSV] Saved jobId to localStorage:', data.jobId);
-
-                                      setCsvLogs(prev => [...prev, `📋 Job created: ${data.jobId}`, '📡 Connecting to SSE for real-time updates...']);
-                                      
-                                      // Connect to SSE for real-time progress
-                                      csvConnectSSE(data.jobId);
-                                    } else if (data.results) {
-                                      // Fallback: Direct results (old mode)
-                                      setCsvGeneratedResults(data.results);
-                                      setIsCsvGenerating(false);
-                                    }
-                                  } catch (err) {
-                                    setError(err instanceof Error ? err.message : 'Generation failed');
-                                    setIsCsvGenerating(false);
-                                    setCsvLogs(prev => [...prev, `❌ Error: ${err instanceof Error ? err.message : 'Generation failed'}`]);
-                                  }
-                                }}
-                                disabled={isCsvGenerating || !csvCampaignName.trim()}
-                                className="mt-4 w-full py-3 px-4 bg-gradient-to-r from-purple-600 to-pink-600 text-white font-semibold rounded-lg hover:from-purple-700 hover:to-pink-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
-                              >
-                                {isCsvGenerating ? (
-                                  <>
-                                    <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
-                                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                                    </svg>
-                                    Generating for {csvData.length} rows...
-                                  </>
-                                ) : (
-                                  <>
-                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                                    </svg>
-                                    Generate {csvData.length} Posters from CSV
-                                  </>
-                                )}
-                              </button>
-
-                              {/* Progress Bar and Logs for CSV Generation */}
-                              {isCsvGenerating && (
-                                <div className="mt-4 p-4 bg-slate-50 rounded-lg border-2 border-slate-200">
-                                  {/* Progress Bar */}
-                                  <div className="mb-3">
-                                    <div className="flex justify-between text-sm text-slate-600 mb-1">
-                                      <span>Processing posters...</span>
-                                      <span>{csvProgress.processed} / {csvProgress.total} ({csvProgress.percentage}%)</span>
-                                    </div>
-                                    <div className="w-full bg-slate-200 rounded-full h-3">
-                                      <div 
-                                        className="bg-gradient-to-r from-purple-600 to-pink-600 h-3 rounded-full transition-all duration-300"
-                                        style={{ width: `${csvProgress.percentage}%` }}
-                                      />
-                                    </div>
-                                  </div>
-                                  
-                                  {/* SSE Connection Status */}
-                                  <div className="flex items-center gap-2 text-xs text-slate-500 mb-2">
-                                    <span className={`w-2 h-2 rounded-full ${csvSSEConnected ? 'bg-green-500' : 'bg-yellow-500'}`} />
-                                    {csvSSEConnected ? 'Connected to real-time updates' : 'Connecting...'}
-                                  </div>
-                                  
-                                  {/* Toggle Logs */}
-                                  <button
-                                    onClick={() => setShowCsvLogs(!showCsvLogs)}
-                                    className="text-xs text-purple-600 hover:text-purple-800 flex items-center gap-1"
-                                  >
-                                    <svg className={`w-3 h-3 transition-transform ${showCsvLogs ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                                    </svg>
-                                    {showCsvLogs ? 'Hide' : 'Show'} console logs ({csvLogs.length})
-                                  </button>
-                                  
-                                  {/* Console Logs */}
-                                  {showCsvLogs && (
-                                    <div className="mt-2 bg-slate-900 text-green-400 p-3 rounded-lg text-xs font-mono max-h-48 overflow-y-auto">
-                                      {csvLogs.map((log, idx) => (
-                                        <div key={idx} className="py-0.5">{log}</div>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-
-                              {/* CSV Generated Results */}
-                              {csvGeneratedResults.length > 0 && (
-                                <div className="mt-6 p-4 bg-white rounded-lg border-2 border-green-200">
-                                  <h3 className="text-sm font-medium text-slate-700 mb-4">
-                                    Generated Posters ({csvGeneratedResults.filter(r => r.success).length} successful)
-                                  </h3>
-
-                                  <div className="grid grid-cols-2 gap-4 max-h-96 overflow-y-auto mb-4">
-                                    {csvGeneratedResults.map((result, idx) => (
-                                      <div key={idx} className="border rounded-lg p-2">
-                                        {result.success ? (
-                                          <>
-                                            <img
-                                              src={result.posterUrl}
-                                              alt={result.username}
-                                              className="w-full rounded"
-                                            />
-                                            <p className="text-xs font-medium mt-2">✅ {result.username}</p>
-                                          </>
-                                        ) : (
-                                          <div className="p-4 text-center">
-                                            <p className="text-xs font-medium text-red-600">❌ {result.username}</p>
-                                            <p className="text-xs text-red-500 mt-1">{result.error}</p>
-                                          </div>
-                                        )}
-                                      </div>
-                                    ))}
-                                  </div>
-
-                                  {/* Save to Database */}
-                                  <button
-                                    onClick={async () => {
-                                      console.log('🚨🚨🚨 [SAVE BUTTON v3] NEW CODE ACTIVE - WITH SSE WAIT 🚨🚨🚨');
-                                      setIsSharing(true);
-                                      setCsvSaveProgress(null); // Reset progress
-                                      try {
-                                        // Get jobId from state or localStorage fallback
-                                        const jobIdToUse = csvJobId || localStorage.getItem('lastCsvJobId');
-                                        console.log(`📥 [PosterCreator v3] csvJobId state: ${csvJobId}`);
-                                        console.log(`📥 [PosterCreator v3] localStorage backup: ${localStorage.getItem('lastCsvJobId')}`);
-                                        console.log(`📥 [PosterCreator v3] Using jobId: ${jobIdToUse}`);
-
-                                        if (!jobIdToUse) {
-                                          alert('❌ Error: Job ID not found. Please generate posters first.');
-                                          setIsSharing(false);
-                                          return;
-                                        }
-
-                                        // FIXED: Fetch posters from backend WITH userId from database metadata
-                                        console.log(`📥 [PosterCreator v2] Fetching posters with userId for job: ${jobIdToUse}`);
-
-                                        const postersResponse = await apiFetch(`/api/batch/jobs/${jobIdToUse}/posters-for-save`);
-                                        const postersData = await postersResponse.json();
-
-                                        if (!postersData.success) {
-                                          throw new Error(postersData.error || 'Failed to fetch posters');
-                                        }
-
-                                        const postersToSave = postersData.posters;
-                                        console.log(`✅ [PosterCreator v2] Fetched ${postersToSave.length} posters with userId:`, postersToSave);
-
-                                        if (postersToSave.length === 0) {
-                                          alert('No posters available to save');
-                                          setIsSharing(false);
-                                          return;
-                                        }
-
-                                        // Check for missing user_id
-                                        if (postersData.totalMissingUserId > 0) {
-                                          const proceed = confirm(
-                                            `⚠️ Warning: ${postersData.totalMissingUserId} posters are missing user_id.\n\n` +
-                                            `${postersData.warning}\n\n` +
-                                            `Proceed with ${postersData.totalPosters} posters that have user_id?`
-                                          );
-                                          if (!proceed) {
-                                            setIsSharing(false);
-                                            return;
-                                          }
-                                        }
-
-                                        const response = await apiFetch('/api/save-bulk-posters', {
-                                          method: 'POST',
-                                          headers: { 'Content-Type': 'application/json' },
-                                          body: JSON.stringify({
-                                            posters: postersToSave,
-                                            posterName: csvCampaignName.trim(),
-                                          }),
-                                        });
-
-                                        const data = await response.json();
-
-                                        if (!response.ok || !data.success || !data.jobId) {
-                                          throw new Error(data.error || 'Save failed');
-                                        }
-
-                                        const saveJobId = data.jobId;
-                                        console.log(`✅ [PosterCreator v3] Save job started: ${saveJobId}`);
-                                        console.log(`🔌 [PosterCreator v3] Connecting to SSE: ${data.sseEndpoint}`);
-
-                                        // Connect to SSE for real-time save progress
-                                        const sseUrl = `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}${data.sseEndpoint}`;
-                                        const eventSource = new EventSource(sseUrl);
-
-                                        eventSource.onopen = () => {
-                                          console.log('✅ [PosterCreator v3] SSE CONNECTED - Waiting for events...');
-                                        };
-
-                                        eventSource.addEventListener('progress', (event) => {
-                                          const progressData = JSON.parse(event.data);
-                                          console.log(`💾 [PosterCreator v3] PROGRESS EVENT: ${progressData.processed}/${progressData.total} (${progressData.success} success, ${progressData.failed} failed)`);
-                                          setCsvSaveProgress({
-                                            processed: progressData.processed,
-                                            total: progressData.total,
-                                            success: progressData.success,
-                                            failed: progressData.failed
-                                          });
-                                        });
-
-                                        eventSource.addEventListener('complete', (event) => {
-                                          console.log('🎉 [PosterCreator v3] COMPLETE EVENT RECEIVED!');
-                                          const completeData = JSON.parse(event.data);
-                                          const { success, failed, total } = completeData;
-
-                                          eventSource.close();
-                                          console.log(`✅ [PosterCreator v3] Save Complete: ${success}/${total} saved successfully, ${failed} failed`);
-
-                                          // Only show success if at least some succeeded
-                                          if (success > 0) {
-                                            console.log('✅ [PosterCreator v3] Setting csvSaveSuccess = TRUE (success > 0)');
-                                            setCsvSaveSuccess(true);
-                                            setCsvSavedConfig({
-                                              campaign: csvCampaignName.trim(),
-                                              content_type: "image"
-                                            });
-                                          } else {
-                                            console.log('❌ [PosterCreator v3] NOT setting success - all failed!');
-                                            alert(`❌ Save Failed!\n\n0 out of ${total} posters were saved successfully.\nAll ${failed} posters failed.\n\nCheck backend logs for details.`);
-                                          }
-
-                                          setIsSharing(false);
-                                        });
-
-                                        eventSource.onerror = (error) => {
-                                          console.error('❌ SSE error during save:', error);
-                                          eventSource.close();
-                                          alert('❌ Connection lost during save. Please check if posters were saved.');
-                                          setIsSharing(false);
-                                        };
-
-                                      } catch (err) {
-                                        alert(`❌ Error: ${err instanceof Error ? err.message : 'Save failed'}`);
-                                        setIsSharing(false);
-                                      }
-                                    }}
-                                    disabled={isSharing}
-                                    className="w-full py-3 px-4 bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white font-semibold rounded-lg transition-colors flex items-center justify-center gap-2"
-                                  >
-                                    {isSharing ? (
-                                      <>
-                                        <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
-                                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                                        </svg>
-                                        {csvSaveProgress ? (
-                                          `Saving ${csvSaveProgress.processed}/${csvSaveProgress.total} (${csvSaveProgress.success} ✓, ${csvSaveProgress.failed} ✗)`
-                                        ) : (
-                                          'Saving...'
-                                        )}
-                                      </>
-                                    ) : (
-                                      <>
-                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
-                                        </svg>
-                                        Save {csvGeneratedResults.filter(r => r.success).length} Posters to Database
-                                      </>
-                                    )}
-                                  </button>
-                                </div>
-                              )}
-
-                              {/* Success Message with Configuration */}
-                              {csvSaveSuccess && csvSavedConfig && (
-                                <div className="mt-6 p-6 bg-green-50 border-2 border-green-500 rounded-lg">
-                                  <div className="flex items-start gap-3 mb-4">
-                                    <svg className="w-6 h-6 text-green-600 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                    </svg>
-                                    <div className="flex-1">
-                                      <h4 className="text-lg font-semibold text-green-800 mb-2">
-                                        ✅ Successfully Saved to Database!
-                                      </h4>
-                                      <p className="text-sm text-green-700 mb-4">
-                                        All posters have been saved to UserShareContent. Now copy the configuration below and paste it in Django Admin.
-                                      </p>
-
-                                      <div className="bg-white rounded-lg p-4 border border-green-300">
-                                        <div className="flex items-center justify-between mb-2">
-                                          <label className="text-sm font-semibold text-slate-700">
-                                            📋 Django Admin Configuration
-                                          </label>
-                                          <button
-                                            onClick={() => {
-                                              navigator.clipboard.writeText(JSON.stringify(csvSavedConfig, null, 2));
-                                              alert('✅ Copied to clipboard!');
-                                            }}
-                                            className="text-xs px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded transition-colors"
-                                          >
-                                            Copy
-                                          </button>
-                                        </div>
-                                        <pre className="bg-slate-900 text-green-400 p-3 rounded text-xs overflow-x-auto font-mono">
-{JSON.stringify(csvSavedConfig, null, 2)}
-                                        </pre>
-                                      </div>
-
-                                      <div className="mt-4 p-3 bg-blue-50 border border-blue-200 rounded">
-                                        <p className="text-xs text-blue-800">
-                                          <strong>Next Step:</strong> Go to Django Admin →
-                                          <a href="http://localhost:8000/admin/sharing/sharingposttemplate/add/" target="_blank" className="underline ml-1">
-                                            Create SharingPostTemplate
-                                          </a> →
-                                          Paste this in the <strong>Configuration</strong> field
-                                        </p>
-                                      </div>
-
-                                      <button
-                                        onClick={() => {
-                                          setCsvSaveSuccess(false);
-                                          setCsvSavedConfig(null);
-                                          setCsvGeneratedResults([]);
-                                          setCsvCampaignName('');
-                                          setCsvFile(null);
-                                          setCsvData([]);
-                                          setCsvColumns([]);
-                                          setCsvTemplate('');
-                                          setCsvPreview('');
-                                        }}
-                                        className="mt-4 w-full py-2 px-4 bg-slate-600 hover:bg-slate-700 text-white font-medium rounded-lg transition-colors"
-                                      >
-                                        Create New Campaign
-                                      </button>
-                                    </div>
-                                  </div>
-                                </div>
-                              )}
+                            <div className="mt-4 p-4 bg-slate-50 rounded-lg border-2 border-slate-200">
+                              <label className="block text-sm font-medium text-slate-700 mb-2">
+                                Campaign Name
+                              </label>
+                              <input
+                                type="text"
+                                value={csvCampaignName}
+                                onChange={(e) => setCsvCampaignName(e.target.value)}
+                                placeholder="e.g., Q4 Sales Campaign"
+                                className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm"
+                              />
                             </div>
                           )}
                         </>
@@ -2807,18 +2766,14 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                   </svg>
-                  {flowMode === 'bulk'
-                    ? 'Generating Templates...'
-                    : mode === 'carousel'
-                      ? 'Generating 3 variants...'
-                      : 'Generating 3 variations...'}
+                  {mode === 'carousel'
+                    ? 'Generating 3 variants...'
+                    : 'Generating 3 variations...'}
                 </span>
               ) : (
-                flowMode === 'bulk'
-                  ? 'Generate Templates'
-                  : mode === 'carousel'
-                    ? `Generate ${slideCount}-Slide Carousel`
-                    : 'Generate Posters'
+                mode === 'carousel'
+                  ? `Generate ${slideCount}-Slide Carousel`
+                  : 'Generate Posters'
               )}
             </button>
 
@@ -2864,7 +2819,444 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
 
           {/* Right: Preview and Edit Panel */}
           <div className={`${isEditMode && showEditPanel ? 'flex gap-4' : ''}`}>
-            {/* Preview Container */}
+            {/* CSV Bulk Mode: Preview & Generation Panel */}
+            {flowMode === 'bulk' && bulkMethod === 'csv' && (
+              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 space-y-6">
+                <h2 className="text-lg font-semibold text-slate-900 flex items-center gap-2">
+                  <svg className="w-5 h-5 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                  </svg>
+                  CSV Bulk Preview & Generation
+                </h2>
+
+                {/* Template Preview Section */}
+                {csvPreview ? (
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-sm font-medium text-slate-700">Template Preview (First Row)</h3>
+                      <button
+                        onClick={() => setCsvPreview('')}
+                        className="text-xs text-slate-500 hover:text-slate-700 flex items-center gap-1"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                        Clear Preview
+                      </button>
+                    </div>
+                    
+                    <div className="border-2 border-slate-300 rounded-lg overflow-hidden bg-slate-50 p-4 flex justify-center">
+                      <div style={{
+                        width: `${csvCustomWidth * 0.4}px`,
+                        height: `${csvCustomHeight * 0.4}px`,
+                        transform: 'scale(0.4)',
+                        transformOrigin: 'top left',
+                        border: '1px solid #e2e8f0'
+                      }}>
+                        <iframe
+                          srcDoc={csvPreview}
+                          className="w-full h-full border-0"
+                          style={{ width: `${csvCustomWidth}px`, height: `${csvCustomHeight}px`, pointerEvents: 'none' }}
+                          title="CSV Preview"
+                          sandbox="allow-same-origin allow-scripts"
+                        />
+                      </div>
+                    </div>
+                    <p className="text-xs text-slate-500 text-center">
+                      Preview with first row data. Will generate for all {csvData.length} rows.
+                    </p>
+
+                    {/* Campaign Name */}
+                    <div className="p-4 bg-slate-50 rounded-lg border border-slate-200">
+                      <label className="block text-sm font-medium text-slate-700 mb-2">
+                        Campaign Name
+                      </label>
+                      <input
+                        type="text"
+                        value={csvCampaignName}
+                        onChange={(e) => setCsvCampaignName(e.target.value)}
+                        placeholder="e.g., Q4 Sales Campaign"
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 text-sm"
+                      />
+                    </div>
+
+                    {/* Generate Button */}
+                    <button
+                      onClick={async () => {
+                        if (!csvCampaignName.trim()) {
+                          alert('Please enter a campaign name');
+                          return;
+                        }
+
+                        setIsCsvGenerating(true);
+                        setCsvGeneratedResults([]);
+                        setCsvProgress({ processed: 0, total: csvData.length, percentage: 0 });
+                        setCsvLogs(['🚀 Starting CSV bulk generation...']);
+                        setShowCsvLogs(true);
+                        setError(null);
+
+                        try {
+                          const topmateLogo = getTopmateLogo();
+
+                          const response = await apiFetch('/api/generate-bulk', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                              bulkMethod: 'csv',
+                              csvTemplate: csvTemplate,
+                              csvData: csvData,
+                              csvColumns: csvColumns,
+                              posterName: csvCampaignName.trim(),
+                              size: 'custom',
+                              customWidth: csvCustomWidth,
+                              customHeight: csvCustomHeight,
+                              skipOverlays: csvSkipOverlays,
+                              topmateLogo: csvSkipOverlays ? null : topmateLogo,
+                            }),
+                          });
+
+                          const data = await response.json();
+
+                          if (!response.ok) {
+                            throw new Error(data.error || 'Generation failed');
+                          }
+
+                          // Check if response has jobId (RedPanda queue mode)
+                          if (data.success && data.jobId) {
+                            console.log('🔗 [CSV] Connecting to SSE for job:', data.jobId);
+                            setCsvJobId(data.jobId);
+                            localStorage.setItem('lastCsvJobId', data.jobId);
+                            setCsvLogs(prev => [...prev, `📋 Job created: ${data.jobId}`, '📡 Connecting to SSE for real-time updates...']);
+                            csvConnectSSE(data.jobId);
+                          } else if (data.results) {
+                            setCsvGeneratedResults(data.results);
+                            setIsCsvGenerating(false);
+                          }
+                        } catch (err) {
+                          setError(err instanceof Error ? err.message : 'Generation failed');
+                          setIsCsvGenerating(false);
+                          setCsvLogs(prev => [...prev, `❌ Error: ${err instanceof Error ? err.message : 'Generation failed'}`]);
+                        }
+                      }}
+                      disabled={isCsvGenerating || !csvCampaignName.trim()}
+                      className="w-full py-3 px-4 bg-gradient-to-r from-purple-600 to-pink-600 text-white font-semibold rounded-lg hover:from-purple-700 hover:to-pink-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
+                    >
+                      {isCsvGenerating ? (
+                        <>
+                          <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                          </svg>
+                          Generating for {csvData.length} rows...
+                        </>
+                      ) : (
+                        <>
+                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                          </svg>
+                          Generate {csvData.length} Posters from CSV
+                        </>
+                      )}
+                    </button>
+
+                    {/* Progress Bar and Logs for CSV Generation */}
+                    {isCsvGenerating && (
+                      <div className="p-4 bg-slate-50 rounded-lg border border-slate-200">
+                        <div className="mb-3">
+                          <div className="flex justify-between text-sm text-slate-600 mb-1">
+                            <span>Processing posters...</span>
+                            <span>{csvProgress.processed} / {csvProgress.total} ({csvProgress.percentage}%)</span>
+                          </div>
+                          <div className="w-full bg-slate-200 rounded-full h-3">
+                            <div 
+                              className="bg-gradient-to-r from-purple-600 to-pink-600 h-3 rounded-full transition-all duration-300"
+                              style={{ width: `${csvProgress.percentage}%` }}
+                            />
+                          </div>
+                        </div>
+                        
+                        <div className="flex items-center gap-2 text-xs text-slate-500 mb-2">
+                          <span className={`w-2 h-2 rounded-full ${csvSSEConnected ? 'bg-green-500' : 'bg-yellow-500'}`} />
+                          {csvSSEConnected ? 'Connected to real-time updates' : 'Connecting...'}
+                        </div>
+                        
+                        <button
+                          onClick={() => setShowCsvLogs(!showCsvLogs)}
+                          className="text-xs text-purple-600 hover:text-purple-800 flex items-center gap-1"
+                        >
+                          <svg className={`w-3 h-3 transition-transform ${showCsvLogs ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                          </svg>
+                          {showCsvLogs ? 'Hide' : 'Show'} logs ({csvLogs.length})
+                        </button>
+                        
+                        {showCsvLogs && (
+                          <div className="mt-2 bg-slate-900 text-green-400 p-3 rounded-lg text-xs font-mono max-h-48 overflow-y-auto">
+                            {csvLogs.map((log, idx) => (
+                              <div key={idx} className="py-0.5">{log}</div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-center min-h-[300px] bg-slate-50 rounded-lg border-2 border-dashed border-slate-300">
+                    <div className="text-center text-slate-400 p-8">
+                      <svg className="w-16 h-16 mx-auto mb-4 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                      </svg>
+                      <p className="font-medium">Upload a template and CSV to preview</p>
+                      <p className="text-sm mt-1">Your bulk generation preview will appear here</p>
+                    </div>
+                  </div>
+                )}
+
+                {/* CSV Generated Results */}
+                {csvGeneratedResults.length > 0 && (
+                  <div className="p-4 bg-white rounded-lg border-2 border-green-200">
+                    <h3 className="text-sm font-medium text-slate-700 mb-4">
+                      Generated Posters ({csvGeneratedResults.filter(r => r.success).length} successful)
+                    </h3>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 max-h-[400px] overflow-y-auto mb-4">
+                      {csvGeneratedResults.map((result, idx) => (
+                        <div key={idx} className="border rounded-lg p-2 bg-slate-50">
+                          {result.success ? (
+                            <>
+                              <img
+                                src={result.posterUrl}
+                                alt={result.username}
+                                className="w-full rounded aspect-square object-cover"
+                              />
+                              <p className="text-xs font-medium mt-2 truncate">✅ {result.username}</p>
+                            </>
+                          ) : (
+                            <div className="p-4 text-center aspect-square flex flex-col items-center justify-center bg-red-50 rounded">
+                              <p className="text-xs font-medium text-red-600">❌ {result.username}</p>
+                              <p className="text-xs text-red-500 mt-1 truncate">{result.error}</p>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Save to Database Button */}
+                    <button
+                      onClick={async () => {
+                        setIsSharing(true);
+                        setIsSavingToDb(true);
+                        setCsvSaveProgress(null);
+                        setCsvSaveSuccess(false);
+                        setCsvSavedConfig(null);
+                        setSaveLogs([]);
+                        setSaveJobId(null);
+                        
+                        try {
+                          const jobIdToUse = csvJobId || localStorage.getItem('lastCsvJobId');
+                          setSaveLogs(prev => [...prev, `📥 Starting save operation for job: ${jobIdToUse}`]);
+
+                          if (!jobIdToUse) {
+                            alert('❌ Error: Job ID not found. Please generate posters first.');
+                            setIsSharing(false);
+                            setIsSavingToDb(false);
+                            return;
+                          }
+
+                          setSaveLogs(prev => [...prev, `📥 Fetching posters from database...`]);
+                          const postersResponse = await apiFetch(`/api/batch/jobs/${jobIdToUse}/posters-for-save`);
+                          const postersData = await postersResponse.json();
+
+                          if (!postersData.success) {
+                            throw new Error(postersData.error || 'Failed to fetch posters');
+                          }
+
+                          const postersToSave = postersData.posters;
+                          setSaveLogs(prev => [...prev, `✅ Found ${postersToSave.length} posters to save`]);
+
+                          if (postersToSave.length === 0) {
+                            alert('No posters available to save');
+                            setIsSharing(false);
+                            setIsSavingToDb(false);
+                            return;
+                          }
+
+                          if (postersData.totalMissingUserId > 0) {
+                            setSaveLogs(prev => [...prev, `⚠️ Warning: ${postersData.totalMissingUserId} posters missing user_id`]);
+                            const proceed = confirm(
+                              `⚠️ Warning: ${postersData.totalMissingUserId} posters are missing user_id.\n\n` +
+                              `${postersData.warning}\n\n` +
+                              `Proceed with ${postersData.totalPosters} posters that have user_id?`
+                            );
+                            if (!proceed) {
+                              setIsSharing(false);
+                              setIsSavingToDb(false);
+                              return;
+                            }
+                          }
+
+                          setSaveLogs(prev => [...prev, `📤 Sending save request to server...`]);
+                          const response = await apiFetch('/api/save-bulk-posters', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                              posters: postersToSave,
+                              posterName: csvCampaignName.trim(),
+                            }),
+                          });
+
+                          const data = await response.json();
+
+                          if (!response.ok || !data.success || !data.jobId) {
+                            throw new Error(data.error || 'Save failed');
+                          }
+
+                          const currentSaveJobId = data.jobId;
+                          setSaveJobId(currentSaveJobId);
+                          setSaveLogs(prev => [...prev, `✅ Save job created: ${currentSaveJobId}`, `🔌 Connecting to SSE...`]);
+
+                          const sseUrl = `${process.env.NEXT_PUBLIC_BACKEND_API_URL || 'http://localhost:8000'}${data.sseEndpoint}`;
+                          const eventSource = new EventSource(sseUrl);
+
+                          const handleSaveComplete = (success: number, failed: number, total: number) => {
+                            setSaveLogs(prev => [...prev, `🎉 Save complete: ${success}/${total} saved, ${failed} failed`]);
+                            if (success > 0) {
+                              setCsvSaveSuccess(true);
+                              setCsvSavedConfig({ campaign: csvCampaignName.trim(), content_type: "image" });
+                            } else {
+                              alert(`❌ Save Failed! 0 out of ${total} posters were saved.`);
+                            }
+                            setIsSharing(false);
+                            setIsSavingToDb(false);
+                          };
+
+                          eventSource.addEventListener('progress', (event) => {
+                            const progressData = JSON.parse(event.data);
+                            setCsvSaveProgress({
+                              processed: progressData.processed,
+                              total: progressData.total,
+                              success: progressData.success,
+                              failed: progressData.failed
+                            });
+                          });
+
+                          eventSource.addEventListener('complete', (event) => {
+                            const completeData = JSON.parse(event.data);
+                            eventSource.close();
+                            handleSaveComplete(completeData.success, completeData.failed, completeData.total);
+                          });
+
+                          eventSource.onerror = () => {
+                            eventSource.close();
+                            setSaveLogs(prev => [...prev, `⚠️ Connection issue, please check results manually`]);
+                            setIsSharing(false);
+                            setIsSavingToDb(false);
+                          };
+
+                        } catch (err) {
+                          alert(`❌ Error: ${err instanceof Error ? err.message : 'Save failed'}`);
+                          setSaveLogs(prev => [...prev, `❌ Error: ${err instanceof Error ? err.message : 'Save failed'}`]);
+                          setIsSharing(false);
+                          setIsSavingToDb(false);
+                        }
+                      }}
+                      disabled={isSharing || isSavingToDb}
+                      className="w-full py-3 px-4 bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white font-semibold rounded-lg transition-colors flex items-center justify-center gap-2"
+                    >
+                      {isSharing || isSavingToDb ? (
+                        <>
+                          <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                          </svg>
+                          {csvSaveProgress ? `Saving ${csvSaveProgress.processed}/${csvSaveProgress.total}` : 'Connecting...'}
+                        </>
+                      ) : (
+                        <>
+                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
+                          </svg>
+                          Save {csvGeneratedResults.filter(r => r.success).length} Posters to Database
+                        </>
+                      )}
+                    </button>
+
+                    {/* Save Progress */}
+                    {isSavingToDb && csvSaveProgress && (
+                      <div className="mt-4 p-3 bg-slate-50 rounded-lg border border-green-200">
+                        <div className="w-full bg-slate-200 rounded-full h-2 mb-2">
+                          <div 
+                            className="bg-green-500 h-2 rounded-full transition-all duration-300"
+                            style={{ width: `${(csvSaveProgress.processed / csvSaveProgress.total) * 100}%` }}
+                          />
+                        </div>
+                        <div className="flex justify-between text-xs text-slate-600">
+                          <span className="text-green-600">✓ {csvSaveProgress.success} saved</span>
+                          {csvSaveProgress.failed > 0 && <span className="text-red-600">✗ {csvSaveProgress.failed} failed</span>}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Success Message */}
+                {csvSaveSuccess && csvSavedConfig && (
+                  <div className="p-6 bg-green-50 border-2 border-green-500 rounded-lg">
+                    <div className="flex items-start gap-3">
+                      <svg className="w-6 h-6 text-green-600 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      <div className="flex-1">
+                        <h4 className="text-lg font-semibold text-green-800 mb-2">
+                          ✅ Successfully Saved to Database!
+                        </h4>
+                        <p className="text-sm text-green-700 mb-4">
+                          All posters have been saved. Copy the configuration below for Django Admin.
+                        </p>
+
+                        <div className="bg-white rounded-lg p-4 border border-green-300">
+                          <div className="flex items-center justify-between mb-2">
+                            <label className="text-sm font-semibold text-slate-700">Django Admin Config</label>
+                            <button
+                              onClick={() => {
+                                navigator.clipboard.writeText(JSON.stringify(csvSavedConfig, null, 2));
+                                alert('✅ Copied to clipboard!');
+                              }}
+                              className="text-xs px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded transition-colors"
+                            >
+                              Copy
+                            </button>
+                          </div>
+                          <pre className="bg-slate-900 text-green-400 p-3 rounded text-xs overflow-x-auto font-mono">
+{JSON.stringify(csvSavedConfig, null, 2)}
+                          </pre>
+                        </div>
+
+                        <button
+                          onClick={() => {
+                            setCsvSaveSuccess(false);
+                            setCsvSavedConfig(null);
+                            setCsvGeneratedResults([]);
+                            setCsvCampaignName('');
+                            setCsvFile(null);
+                            setCsvData([]);
+                            setCsvColumns([]);
+                            setCsvTemplate('');
+                            setCsvPreview('');
+                          }}
+                          className="mt-4 w-full py-2 px-4 bg-slate-600 hover:bg-slate-700 text-white font-medium rounded-lg transition-colors"
+                        >
+                          Create New Campaign
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Single/Carousel Mode: Preview Container */}
+            {!(flowMode === 'bulk' && bulkMethod === 'csv') && (
             <div className={`bg-white rounded-xl shadow-sm border border-slate-200 p-6 ${isEditMode && showEditPanel ? 'flex-1' : ''}`}>
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold text-slate-900">
@@ -3228,6 +3620,7 @@ export default function PosterCreator({ onBack }: PosterCreatorProps) {
               </div>
             )}
           </div>
+            )}
 
           {/* Edit Panel - Right Side */}
           {showEditPanel && poster && (

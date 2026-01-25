@@ -67,45 +67,71 @@ class HTMLToImageConverter:
         Returns:
             PNG image as bytes
         """
+        import re
+        
         # Lazy initialization if not already done
         if not self._browser:
             await self.initialize()
 
         page = None
         try:
-            # Create new page with exact viewport
+            # Check if html already has DOCTYPE or html tag
+            html_lower = html.strip().lower()
+            is_complete_html = html_lower.startswith('<!doctype') or html_lower.startswith('<html')
+            
+            # For complete HTML templates, try to extract dimensions from CSS
+            actual_width = width
+            actual_height = height
+            
+            if is_complete_html:
+                # Look for poster-container or similar with fixed dimensions
+                # Pattern: width: XXXpx and height: XXXpx in CSS
+                width_match = re.search(r'\.poster-container[^}]*width:\s*(\d+)px', html, re.IGNORECASE | re.DOTALL)
+                height_match = re.search(r'\.poster-container[^}]*height:\s*(\d+)px', html, re.IGNORECASE | re.DOTALL)
+                
+                if width_match and height_match:
+                    actual_width = int(width_match.group(1))
+                    actual_height = int(height_match.group(1))
+                    print(f"[HTML2PNG] Extracted dimensions from template: {actual_width}x{actual_height}")
+                else:
+                    # Try to find any container with fixed dimensions
+                    width_match = re.search(r'width:\s*(\d+)px', html)
+                    height_match = re.search(r'height:\s*(\d+)px', html)
+                    if width_match and height_match:
+                        extracted_w = int(width_match.group(1))
+                        extracted_h = int(height_match.group(1))
+                        # Only use if they look like poster dimensions (> 500px)
+                        if extracted_w >= 500 and extracted_h >= 500:
+                            actual_width = extracted_w
+                            actual_height = extracted_h
+                            print(f"[HTML2PNG] Using extracted dimensions: {actual_width}x{actual_height}")
+
+            # Create new page with the appropriate viewport
             page = await self._browser.new_page(
-                viewport={'width': width, 'height': height},
+                viewport={'width': actual_width, 'height': actual_height},
                 device_scale_factor=scale
             )
 
             # Set default timeout for this page
             page.set_default_timeout(timeout)
 
-            # Wrap HTML to ensure it fills the viewport
-            # This handles templates that have their own body/html with different dimensions
-            wrapped_html = f"""<!DOCTYPE html>
+            # Prepare HTML content
+            if is_complete_html:
+                # Use template as-is without any CSS injection
+                final_html = html
+                print(f"[HTML2PNG] Using complete HTML template as-is")
+            else:
+                # Wrap simple HTML fragments in a proper document
+                final_html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width={width}, height={height}">
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         html, body {{
-            width: {width}px;
-            height: {height}px;
+            width: {actual_width}px;
+            height: {actual_height}px;
             overflow: hidden;
-            background: transparent;
-        }}
-        body {{
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }}
-        /* Scale content to fit viewport if it has fixed dimensions */
-        body > * {{
-            max-width: 100%;
-            max-height: 100%;
         }}
     </style>
 </head>
@@ -113,29 +139,10 @@ class HTMLToImageConverter:
 {html}
 </body>
 </html>"""
-
-            # Check if html already has DOCTYPE or html tag - if so, use it directly
-            html_lower = html.strip().lower()
-            if html_lower.startswith('<!doctype') or html_lower.startswith('<html'):
-                # Template already has full HTML structure - inject scaling CSS instead
-                wrapped_html = html
-                # Inject CSS to force viewport size
-                if '<head>' in html.lower():
-                    inject_css = f"""<style>
-                        html, body {{ 
-                            width: {width}px !important; 
-                            height: {height}px !important; 
-                            margin: 0 !important; 
-                            padding: 0 !important;
-                            overflow: hidden !important;
-                        }}
-                    </style>"""
-                    # Insert after <head>
-                    head_end_idx = html.lower().find('<head>') + 6
-                    wrapped_html = html[:head_end_idx] + inject_css + html[head_end_idx:]
+                print(f"[HTML2PNG] Wrapped HTML fragment in document")
 
             # Set content and wait for network to be idle (ensures all resources loaded)
-            await page.set_content(wrapped_html, wait_until='networkidle', timeout=timeout)
+            await page.set_content(final_html, wait_until='networkidle', timeout=timeout)
 
             # Wait for fonts to be ready (important for first batch)
             await page.evaluate('document.fonts.ready')
@@ -143,20 +150,20 @@ class HTMLToImageConverter:
             # Additional wait to ensure everything is rendered properly
             await page.wait_for_timeout(1500)
 
-            # Take screenshot with exact dimensions
+            # Take screenshot with exact dimensions matching the actual viewport
             screenshot_bytes = await page.screenshot(
                 type='png',
                 full_page=False,
                 clip={
                     'x': 0,
                     'y': 0,
-                    'width': width,
-                    'height': height
+                    'width': actual_width,
+                    'height': actual_height
                 },
                 timeout=timeout
             )
 
-            print(f"[HTML2PNG] Screenshot captured: {len(screenshot_bytes)} bytes ({width}x{height})")
+            print(f"[HTML2PNG] Screenshot captured: {len(screenshot_bytes)} bytes ({actual_width}x{actual_height})")
 
             return screenshot_bytes
 
